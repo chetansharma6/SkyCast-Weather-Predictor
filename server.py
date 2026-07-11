@@ -29,8 +29,13 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 BASE_DIR = Path(__file__).resolve().parent
-PUBLIC_DIR = BASE_DIR / "public"
 OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
+
+# Static assets live at the project root now (index.html + css/ + js/).
+# To avoid ever serving secrets or source, we use a strict allow-list:
+# only index.html at the root, and files inside these folders, are public.
+STATIC_ROOT_FILES = {"index.html", "favicon.ico"}
+STATIC_DIRS = {"css", "js"}
 
 
 # --------------------------------------------------------------------------- #
@@ -162,10 +167,24 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         if path == "/":
             path = "/index.html"
 
-        # Resolve against PUBLIC_DIR and refuse anything that escapes it.
-        target = (PUBLIC_DIR / path.lstrip("/")).resolve()
+        rel = path.lstrip("/")
+        parts = rel.split("/")
+
+        # Allow-list: only index.html (and favicon) at the root, or files
+        # inside css/ and js/. This guarantees .env, server.py, .git, etc.
+        # can never be served, no matter what the client requests.
+        allowed = (
+            (len(parts) == 1 and parts[0] in STATIC_ROOT_FILES)
+            or (len(parts) > 1 and parts[0] in STATIC_DIRS)
+        )
+        if not allowed or any(p in ("", "..", ".") for p in parts):
+            self._send_error_json(404, "Not found.")
+            return
+
+        # Resolve against BASE_DIR and refuse anything that escapes it.
+        target = (BASE_DIR / rel).resolve()
         try:
-            target.relative_to(PUBLIC_DIR)
+            target.relative_to(BASE_DIR)
         except ValueError:
             self._send_error_json(403, "Forbidden.")
             return
@@ -192,8 +211,8 @@ class SkyCastHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    if not PUBLIC_DIR.is_dir():
-        print(f"ERROR: public/ folder not found at {PUBLIC_DIR}", file=sys.stderr)
+    if not (BASE_DIR / "index.html").is_file():
+        print(f"ERROR: index.html not found at {BASE_DIR}", file=sys.stderr)
         sys.exit(1)
 
     banner = "  SkyCast is running!"

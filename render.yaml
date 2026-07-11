@@ -1,0 +1,22 @@
+# ==============================================================
+#  Render Blueprint for SkyCast
+#  Docs: https://render.com/docs/blueprint-spec
+#
+#  With this file in the repo, Render can create the whole service
+#  automatically:  New +  ->  Blueprint  ->  pick this repo.
+# ==============================================================
+services:
+  - type: web
+    name: skycast
+    runtime: python
+    plan: free
+    # No dependencies to install, but Render expects a build command.
+    buildCommand: "pip install -r requirements.txt"
+    # Render sets $PORT; server.py reads it and binds 0.0.0.0.
+    startCommand: "python server.py"
+    envVars:
+      # The secret key is NOT stored here. `sync: false` tells Render to
+      # prompt for it in the dashboard and keep it encrypted — it never
+      # touches the repo or Git history.
+      - key: OPENWEATHER_API_KEY
+        sync: false
