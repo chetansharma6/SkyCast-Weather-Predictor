@@ -1,0 +1,25 @@
+# ==============================================================
+#  SkyCast — files that must NEVER be committed
+# ==============================================================
+
+# Secret API key lives here. This is the whole point: the key
+# stays on your machine and never reaches Git or GitHub.
+.env
+.env.local
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
