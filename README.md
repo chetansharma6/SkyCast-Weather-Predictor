@@ -1,4 +1,4 @@
-# ⛅ SkyCast — Weather Predictor
+# SkyCast — Weather Predictor
 
 **Real-time weather for any city in the world.** SkyCast is a responsive
 web application that fetches live conditions from the
@@ -13,26 +13,26 @@ server-side, and **never reaches the browser or the Git history.**
 
 ---
 
-## ✨ Features
+## Features
 
-- **🔍 City search** — look up current weather for any city worldwide.
-- **📍 Use my location** — one tap uses the browser's Geolocation API to
+- ** City search** — look up current weather for any city worldwide.
+- ** Use my location** — one tap uses the browser's Geolocation API to
   fetch weather for where you are.
-- **🌡️ Live metrics** — temperature, "feels like", humidity, wind speed,
+- ** Live metrics** — temperature, "feels like", humidity, wind speed,
   atmospheric pressure, visibility, and sunrise / sunset times.
 - **°C / °F toggle** — switch units instantly; conversion happens
   client-side with **no extra network request**.
-- **🎨 Weather-aware UI** — the background gradient shifts for clear skies
+- ** Weather-aware UI** — the background gradient shifts for clear skies
   (day & night), clouds, rain, thunderstorms, snow, and mist.
-- **⏳ Loading states** — an animated spinner while data is in flight.
-- **⚠️ Robust error handling** — friendly, specific messages for invalid
+- ** Loading states** — an animated spinner while data is in flight.
+- ** Robust error handling** — friendly, specific messages for invalid
   cities, denied location permission, network failures, and server issues.
-- **📱 Fully responsive** — mobile-first layout that scales cleanly from
+- ** Fully responsive** — mobile-first layout that scales cleanly from
   phones to desktops, with reduced-motion support for accessibility.
 
 ---
 
-## 🔐 How your API key stays private
+## How your API key stays private
 
 This is the core design decision of the project.
 
@@ -54,7 +54,7 @@ Browser  ──►  /api/weather  ──►  server.py (adds secret key)  ──
 
 ---
 
-## 🗂️ Project structure
+## Project structure
 
 ```
 Skycast-Weather-Predictor/
@@ -83,7 +83,7 @@ secrets like `.env` can never be served.
 
 ---
 
-## 🚀 Getting started
+## Getting started
 
 ### Prerequisites
 
@@ -91,9 +91,7 @@ secrets like `.env` can never be served.
 - A free **OpenWeather API key** →
   [get one here](https://home.openweathermap.org/api_keys)
 
-> ℹ️ A brand-new OpenWeather key can take a little while (up to ~2 hours)
-> to activate. Until then the API returns a 401, and SkyCast will show
-> *"Weather service rejected the API key."*
+> A brand-new OpenWeather key can take a little while (up to ~2 hours) to activate. Until then the API returns a 401, and SkyCast will show *"Weather service rejected the API key."*
 
 ### Setup
 
@@ -172,16 +170,16 @@ The repo ships a [`render.yaml`](render.yaml) blueprint:
    - **Key:** `OPENWEATHER_API_KEY`  **Value:** *your real key*
 4. Click **Create Web Service**.
 
-> 🔒 **Your key is never in the code or Git.** Locally it's in the
+> **Your key is never in the code or Git.** Locally it's in the
 > git-ignored `.env`; on Render it's a dashboard secret. In both cases it's
 > injected server-side and never reaches the browser.
 
-> 💤 On Render's free plan the service sleeps after inactivity, so the first
+> On Render's free plan the service sleeps after inactivity, so the first
 > request after idle may take ~30 seconds to wake up.
 
 ---
 
-## 🛠️ Tech & concepts demonstrated
+## Tech & concepts demonstrated
 
 | Area                     | What's used                                                        |
 | ------------------------ | ------------------------------------------------------------------ |
@@ -195,7 +193,7 @@ The repo ships a [`render.yaml`](render.yaml) blueprint:
 
 ---
 
-## 🌐 API reference (local proxy)
+## API reference (local proxy)
 
 `GET /api/weather`
 
@@ -210,7 +208,7 @@ key is added by the server and is never part of this request or response.
 
 ---
 
-## 📄 License
+## License
 
 Free to use for learning and personal projects. Weather data is provided by
 [OpenWeather](https://openweathermap.org/).
