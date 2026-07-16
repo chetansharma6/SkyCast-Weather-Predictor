@@ -123,7 +123,7 @@ That's it — search for a city or tap 📍 to use your location.
 
 ---
 
-## ☁️ Deploying live on Render
+## Deploying live on Render
 
 SkyCast is built to deploy on [Render](https://render.com) as a single
 **Web Service** — the same `server.py` that serves the front-end locally
