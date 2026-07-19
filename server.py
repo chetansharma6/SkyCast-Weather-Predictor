@@ -75,7 +75,19 @@ CONTENT_TYPES = {
 
 
 class SkyCastHandler(BaseHTTPRequestHandler):
-    server_version = "SkyCast/1.0"
+    server_version = "SkyCast"
+
+    # Don't advertise the runtime. BaseHTTPRequestHandler normally appends
+    # "Python/3.x.y" to the Server header, which leaks implementation
+    # details; return a single opaque token instead.
+    def version_string(self) -> str:  # noqa: D401 (stdlib override)
+        return self.server_version
+
+    def end_headers(self) -> None:
+        # Baseline hardening headers applied to every response.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
 
     # ----- helpers -------------------------------------------------------- #
     def _send_json(self, status: int, payload: dict) -> None:
