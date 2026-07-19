@@ -29,6 +29,9 @@ server-side, and **never reaches the browser or the Git history.**
   cities, denied location permission, network failures, and server issues.
 - ** Fully responsive** — mobile-first layout that scales cleanly from
   phones to desktops, with reduced-motion support for accessibility.
+- ** Fast by design** — HTTP/1.1 keep-alive, in-memory static caching with
+  ETag/`304` revalidation, gzip for text assets, and a short-TTL cache for
+  weather responses so repeat lookups skip the upstream round-trip.
 
 ---
 
