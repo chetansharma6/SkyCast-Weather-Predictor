@@ -7,6 +7,8 @@
   <meta name="theme-color" content="#0b1e3f" />
   <title>SkyCast · Weather</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛅</text></svg>" />
+  <!-- Warm up the TCP+TLS connection to the weather-icon CDN early. -->
+  <link rel="preconnect" href="https://openweathermap.org" crossorigin />
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
@@ -142,9 +144,10 @@
     </footer>
   </div>
 
-  <!-- JS modules: order matters (helpers before app) -->
-  <script src="js/api.js"></script>
-  <script src="js/ui.js"></script>
-  <script src="js/app.js"></script>
+  <!-- JS modules: order matters (helpers before app). `defer` lets them
+       download in parallel with parsing and run in order after the DOM. -->
+  <script src="js/api.js" defer></script>
+  <script src="js/ui.js" defer></script>
+  <script src="js/app.js" defer></script>
 </body>
 </html>
