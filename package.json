@@ -1,0 +1,13 @@
+{
+  "name": "skycast-weather-predictor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Frontend test tooling for SkyCast (the app itself ships as plain HTML/CSS/JS with no build step or runtime dependencies).",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.0",
+    "vitest": "^4.1.10"
+  }
+}
