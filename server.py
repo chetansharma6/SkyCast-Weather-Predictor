@@ -37,13 +37,14 @@ import json
 import os
 import sys
 import time
+from collections import OrderedDict, deque
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import urlencode, urlparse, parse_qs
-from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 BASE_DIR = Path(__file__).resolve().parent
 OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
@@ -81,6 +82,21 @@ GZIP_MIN_BYTES = 256
 # back to OpenWeather. Conditions don't change second-to-second, so a short
 # window cuts latency and upstream calls without noticeably stale data.
 WEATHER_TTL = 120
+
+# Cap on distinct cache keys so an attacker can't grow memory without bound
+# by requesting many different cities/coordinates.
+WEATHER_CACHE_MAX_ENTRIES = 500
+
+# Basic per-client abuse protection on the paid upstream endpoint.
+RATE_LIMIT_MAX_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+# How often (seconds) to sweep stale/empty rate-limit buckets so the tracking
+# dict itself doesn't grow unbounded with one-off visitors.
+RATE_LIMIT_SWEEP_INTERVAL = 300
+
+# City query bounds. OpenWeather city names are short; anything longer is
+# either a mistake or an attempt to send an oversized request upstream.
+MAX_CITY_LENGTH = 100
 
 
 # --------------------------------------------------------------------------- #
@@ -150,7 +166,7 @@ class _StaticCache:
             "signature": signature,
             "raw": raw,
             "gz": gz,
-            "etag": '"%x-%x"' % (stat.st_size, stat.st_mtime_ns),
+            "etag": f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"',
             "last_modified": formatdate(stat.st_mtime, usegmt=True),
             "content_type": content_type,
         }
@@ -160,17 +176,24 @@ class _StaticCache:
 
 
 class _WeatherCache:
-    """Short-TTL cache of upstream weather payloads keyed by the user query."""
+    """Short-TTL, size-bounded cache of upstream payloads keyed by query.
 
-    def __init__(self, ttl: float) -> None:
+    Bounded with a simple LRU: the oldest entry is evicted once the cache
+    grows past `max_entries`, so a burst of unique lookups can't grow memory
+    without limit.
+    """
+
+    def __init__(self, ttl: float, max_entries: int) -> None:
         self._ttl = ttl
-        self._entries: dict[str, tuple[float, bytes]] = {}
+        self._max_entries = max_entries
+        self._entries: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self._lock = Lock()
 
     def get(self, key: str):
         with self._lock:
             hit = self._entries.get(key)
             if hit and hit[0] > time.time():
+                self._entries.move_to_end(key)
                 return hit[1]
             if hit:  # expired — drop it
                 self._entries.pop(key, None)
@@ -179,10 +202,63 @@ class _WeatherCache:
     def put(self, key: str, body: bytes) -> None:
         with self._lock:
             self._entries[key] = (time.time() + self._ttl, body)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+class _RateLimiter:
+    """Sliding-window request limiter, keyed per client (e.g. IP address).
+
+    Guards the paid upstream endpoint from being hammered by a single
+    misbehaving client. Not a substitute for a real edge/WAF rate limit in a
+    multi-instance deployment, but effective for a single-process server.
+    """
+
+    def __init__(self, max_requests: int, window: float, sweep_interval: float) -> None:
+        self._max = max_requests
+        self._window = window
+        self._sweep_interval = sweep_interval
+        self._hits: dict[str, deque] = {}
+        self._lock = Lock()
+        self._next_sweep = time.time() + sweep_interval
+
+    def allow(self, key: str) -> tuple[bool, float]:
+        """Returns (allowed, retry_after_seconds)."""
+        now = time.time()
+        with self._lock:
+            dq = self._hits.setdefault(key, deque())
+            cutoff = now - self._window
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+
+            if len(dq) >= self._max:
+                retry_after = max(dq[0] + self._window - now, 0.0)
+                self._maybe_sweep(now)
+                return False, retry_after
+
+            dq.append(now)
+            self._maybe_sweep(now)
+            return True, 0.0
+
+    def _maybe_sweep(self, now: float) -> None:
+        """Drop empty buckets so one-off visitors don't accumulate forever.
+
+        Caller already holds `self._lock`.
+        """
+        if now < self._next_sweep:
+            return
+        self._next_sweep = now + self._sweep_interval
+        cutoff = now - self._window
+        for key in [k for k, dq in self._hits.items() if not dq or dq[-1] <= cutoff]:
+            self._hits.pop(key, None)
 
 
 STATIC_CACHE = _StaticCache()
-WEATHER_CACHE = _WeatherCache(WEATHER_TTL)
+WEATHER_CACHE = _WeatherCache(WEATHER_TTL, WEATHER_CACHE_MAX_ENTRIES)
+WEATHER_RATE_LIMITER = _RateLimiter(
+    RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_SWEEP_INTERVAL
+)
 
 
 class SkyCastHandler(BaseHTTPRequestHandler):
@@ -202,11 +278,48 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         # Baseline hardening headers applied to every response.
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        # Only this origin may load scripts/styles; the weather icon CDN is
+        # the sole cross-origin resource the page needs, and only for images.
+        # connect-src also allow-lists it (some browsers gate <link
+        # rel="preconnect"> on connect-src), so the page's early-connection
+        # hint to that CDN isn't silently dropped.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "img-src 'self' https://openweathermap.org data:; "
+            "style-src 'self'; "
+            "script-src 'self'; "
+            "connect-src 'self' https://openweathermap.org; "
+            "base-uri 'none'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'",
+        )
+        # The app only ever needs its own geolocation prompt; deny every
+        # other sensitive browser capability by default.
+        self.send_header(
+            "Permissions-Policy",
+            "geolocation=(self), camera=(), microphone=(), payment=()",
+        )
         super().end_headers()
 
     # ----- low-level body writer ------------------------------------------ #
     def _client_accepts_gzip(self) -> bool:
         return "gzip" in self.headers.get("Accept-Encoding", "").lower()
+
+    def _client_ip(self) -> str:
+        """Best-effort client identifier for rate limiting.
+
+        Trusts X-Forwarded-For when present (Render and most PaaS proxies
+        set it) so limits apply per real visitor rather than per shared
+        proxy connection. This is only used for coarse abuse mitigation, not
+        as a security boundary, so a spoofed header merely lets a client
+        evade its own limit rather than anyone else's.
+        """
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return self.client_address[0]
 
     def _send_body(
         self,
@@ -243,17 +356,23 @@ class SkyCastHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
     # ----- JSON helpers --------------------------------------------------- #
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(
+        self, status: int, payload: dict, *, extra_headers: dict | None = None
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
+        headers = {"Cache-Control": "no-store"}
+        headers.update(extra_headers or {})
         self._send_body(
             status,
             body,
             "application/json; charset=utf-8",
-            extra_headers={"Cache-Control": "no-store"},
+            extra_headers=headers,
         )
 
-    def _send_error_json(self, status: int, message: str) -> None:
-        self._send_json(status, {"error": message})
+    def _send_error_json(
+        self, status: int, message: str, *, extra_headers: dict | None = None
+    ) -> None:
+        self._send_json(status, {"error": message}, extra_headers=extra_headers)
 
     # ----- routing -------------------------------------------------------- #
     def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
@@ -271,6 +390,15 @@ class SkyCastHandler(BaseHTTPRequestHandler):
 
     # ----- /api/weather --------------------------------------------------- #
     def handle_weather(self, query: dict) -> None:
+        allowed, retry_after = WEATHER_RATE_LIMITER.allow(self._client_ip())
+        if not allowed:
+            self._send_error_json(
+                429,
+                "Too many requests. Please wait a moment and try again.",
+                extra_headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+            return
+
         if not API_KEY:
             self._send_error_json(
                 500,
@@ -283,15 +411,30 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         params = {"appid": API_KEY, "units": "metric"}
 
         city = (query.get("city", [""])[0]).strip()
-        lat = (query.get("lat", [""])[0]).strip()
-        lon = (query.get("lon", [""])[0]).strip()
+        lat_raw = (query.get("lat", [""])[0]).strip()
+        lon_raw = (query.get("lon", [""])[0]).strip()
 
         if city:
+            if len(city) > MAX_CITY_LENGTH:
+                self._send_error_json(
+                    400, f"City name must be {MAX_CITY_LENGTH} characters or fewer."
+                )
+                return
             params["q"] = city
             cache_key = f"city:{city.lower()}"
-        elif lat and lon:
-            params["lat"] = lat
-            params["lon"] = lon
+        elif lat_raw and lon_raw:
+            try:
+                lat, lon = float(lat_raw), float(lon_raw)
+            except ValueError:
+                self._send_error_json(400, "'lat' and 'lon' must be numbers.")
+                return
+            if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+                self._send_error_json(
+                    400, "'lat' must be within -90..90 and 'lon' within -180..180."
+                )
+                return
+            params["lat"] = lat_raw
+            params["lon"] = lon_raw
             cache_key = f"coord:{lat},{lon}"
         else:
             self._send_error_json(
