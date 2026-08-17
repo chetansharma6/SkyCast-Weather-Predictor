@@ -1,36 +1,31 @@
+```python
 """
-SkyCast — backend proxy server (Python standard library only).
+SkyCast backend proxy.
 
-Why this file exists
---------------------
-The OpenWeather API key must never reach the browser or Git. A pure
-front-end app cannot hide the key (it would travel in the browser's
-network request). So this tiny server sits in the middle:
+Browser
+    -> /api/weather
+    -> this server
+    -> OpenWeather
 
-    browser  ->  /api/weather  ->  THIS server (adds secret key)  ->  OpenWeather
+The OpenWeather API key stays server-side in OPENWEATHER_API_KEY.
 
-The key is read from the git-ignored .env file and is only ever used
-here, server-side. The browser only ever talks to /api/... on this
-server and never sees the key.
+Standard library only.
 
-Run it with:   python server.py
-Then open:     http://localhost:8000
+Recommended production deployment:
+    Internet
+        |
+      HTTPS
+        |
+   reverse proxy / WAF
+        |
+    SkyCast server
 
-No third-party packages required — only Python's standard library.
-
-Performance notes
------------------
-This server is small but not naive. To stay fast it:
-  * speaks HTTP/1.1 with keep-alive, so index + css + js load over a
-    single reused connection instead of a handshake per file;
-  * reads each static asset from disk once and caches the bytes (plus a
-    gzip-compressed copy) in memory, keyed by file mtime;
-  * supports conditional requests (ETag / Last-Modified), so a browser
-    that already has an asset gets a tiny 304 instead of the whole file;
-  * gzips compressible text when the client advertises support;
-  * caches upstream weather responses briefly, so repeated lookups for
-    the same place skip the network round-trip and save API quota.
+This file is intentionally small and dependency-free. It is suitable for
+small deployments and local use. For high-traffic production workloads,
+place it behind a real reverse proxy/application server.
 """
+
+from __future__ import annotations
 
 import gzip
 import json
@@ -41,21 +36,59 @@ from collections import OrderedDict, deque
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import Condition, Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
 BASE_DIR = Path(__file__).resolve().parent
+
 OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
 
-# Static assets live at the project root now (index.html + css/ + js/).
-# To avoid ever serving secrets or source, we use a strict allow-list:
-# only index.html at the root, and files inside these folders, are public.
-STATIC_ROOT_FILES = {"index.html", "favicon.ico"}
-STATIC_DIRS = {"css", "js"}
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8000"))
 
-# Content types we are willing to serve, and whether each compresses well.
+WEATHER_TTL = 120.0
+
+WEATHER_CACHE_MAX_ENTRIES = 500
+
+RATE_LIMIT_MAX_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+RATE_LIMIT_MAX_CLIENTS = 10_000
+RATE_LIMIT_SWEEP_INTERVAL = 300.0
+
+MAX_CITY_LENGTH = 100
+
+MAX_QUERY_LENGTH = 512
+
+MAX_UPSTREAM_RESPONSE_BYTES = 128 * 1024
+
+UPSTREAM_TIMEOUT_SECONDS = 8
+
+GZIP_MIN_BYTES = 256
+
+STATIC_CACHE_SECONDS = 300
+
+
+# ============================================================================
+# Static file policy
+# ============================================================================
+
+STATIC_ROOT_FILES = {
+    "index.html",
+    "favicon.ico",
+}
+
+STATIC_DIRS = {
+    "css",
+    "js",
+}
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -66,7 +99,7 @@ CONTENT_TYPES = {
     ".png": "image/png",
     ".webmanifest": "application/manifest+json",
 }
-# Text-ish types worth gzipping (binary formats like png/ico don't benefit).
+
 COMPRESSIBLE = {
     "text/html; charset=utf-8",
     "text/css; charset=utf-8",
@@ -75,527 +108,1179 @@ COMPRESSIBLE = {
     "image/svg+xml",
     "application/manifest+json",
 }
-# Only compress bodies above this size; tiny payloads aren't worth the header.
-GZIP_MIN_BYTES = 256
-
-# How long (seconds) a fetched weather payload may be reused before we go
-# back to OpenWeather. Conditions don't change second-to-second, so a short
-# window cuts latency and upstream calls without noticeably stale data.
-WEATHER_TTL = 120
-
-# Cap on distinct cache keys so an attacker can't grow memory without bound
-# by requesting many different cities/coordinates.
-WEATHER_CACHE_MAX_ENTRIES = 500
-
-# Basic per-client abuse protection on the paid upstream endpoint.
-RATE_LIMIT_MAX_REQUESTS = 30
-RATE_LIMIT_WINDOW_SECONDS = 60
-# How often (seconds) to sweep stale/empty rate-limit buckets so the tracking
-# dict itself doesn't grow unbounded with one-off visitors.
-RATE_LIMIT_SWEEP_INTERVAL = 300
-
-# City query bounds. OpenWeather city names are short; anything longer is
-# either a mistake or an attempt to send an oversized request upstream.
-MAX_CITY_LENGTH = 100
 
 
-# --------------------------------------------------------------------------- #
-#  Tiny .env loader (so we don't need python-dotenv)
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# Environment
+# ============================================================================
+
 def load_env(path: Path) -> None:
-    """Load KEY=VALUE lines from a .env file into os.environ."""
-    if not path.exists():
+    """
+    Minimal .env loader.
+
+    Existing real environment variables always win.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    except OSError as exc:
+        print(f"Warning: unable to read {path}: {exc}", file=sys.stderr)
+        return
+
+    for raw in text.splitlines():
         line = raw.strip()
+
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, value = line.partition("=")
+
+        key, value = line.split("=", 1)
+
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        # Don't clobber a value already set in the real environment.
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+
         os.environ.setdefault(key, value)
 
 
 load_env(BASE_DIR / ".env")
 
 API_KEY = os.environ.get("OPENWEATHER_API_KEY", "").strip()
-PORT = int(os.environ.get("PORT", "8000"))
 
 
-# --------------------------------------------------------------------------- #
-#  In-memory caches (shared across threads)
-# --------------------------------------------------------------------------- #
-class _StaticCache:
-    """Caches file bytes + a gzip copy, invalidated when the file changes."""
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def json_bytes(payload: dict) -> bytes:
+    """
+    Compact JSON encoding.
+
+    separators remove unnecessary whitespace and reduce response size.
+    """
+
+    return json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def clamp_text(value: str, maximum: int) -> str:
+    return value.strip()[:maximum]
+
+
+def normalize_city(city: str) -> str:
+    """
+    Normalize city input for cache consistency.
+
+    Multiple spaces and case differences should map to the same cache key.
+    """
+
+    return " ".join(city.split()).casefold()
+
+
+def valid_coordinate(value: float, minimum: float, maximum: float) -> bool:
+    return minimum <= value <= maximum
+
+
+# ============================================================================
+# Static cache
+# ============================================================================
+
+class StaticCache:
+    """
+    Thread-safe in-memory cache of static assets.
+
+    Stores:
+        raw bytes
+        optional gzip bytes
+        ETag
+        Last-Modified
+        content type
+    """
 
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
         self._lock = Lock()
 
-    def get(self, target: Path):
-        """Return an entry dict for `target`, refreshing it if the file moved.
-
-        Entry keys: raw, gz, etag, last_modified, content_type.
-        Returns None if the file no longer exists.
-        """
+    def get(self, target: Path) -> dict | None:
         try:
             stat = target.stat()
         except OSError:
             return None
 
+        signature = (
+            stat.st_mtime_ns,
+            stat.st_size,
+        )
+
         key = str(target)
-        signature = (stat.st_mtime_ns, stat.st_size)
+
         with self._lock:
             cached = self._entries.get(key)
+
             if cached and cached["signature"] == signature:
                 return cached
 
-        # Read outside the lock — the file is small and this keeps the lock
-        # from being held across disk I/O.
-        raw = target.read_bytes()
+        try:
+            raw = target.read_bytes()
+        except OSError:
+            return None
+
         content_type = CONTENT_TYPES.get(
-            target.suffix.lower(), "application/octet-stream"
+            target.suffix.lower(),
+            "application/octet-stream",
         )
-        gz = (
-            gzip.compress(raw, compresslevel=6)
-            if content_type in COMPRESSIBLE and len(raw) >= GZIP_MIN_BYTES
-            else None
-        )
+
+        compressed = None
+
+        if (
+            content_type in COMPRESSIBLE
+            and len(raw) >= GZIP_MIN_BYTES
+        ):
+            compressed = gzip.compress(
+                raw,
+                compresslevel=6,
+            )
+
         entry = {
             "signature": signature,
             "raw": raw,
-            "gz": gz,
+            "gz": compressed,
             "etag": f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"',
-            "last_modified": formatdate(stat.st_mtime, usegmt=True),
+            "last_modified": formatdate(
+                stat.st_mtime,
+                usegmt=True,
+            ),
             "content_type": content_type,
         }
+
         with self._lock:
             self._entries[key] = entry
+
         return entry
 
 
-class _WeatherCache:
-    """Short-TTL, size-bounded cache of upstream payloads keyed by query.
+STATIC_CACHE = StaticCache()
 
-    Bounded with a simple LRU: the oldest entry is evicted once the cache
-    grows past `max_entries`, so a burst of unique lookups can't grow memory
-    without limit.
+
+# ============================================================================
+# Weather cache
+# ============================================================================
+
+class WeatherCache:
+    """
+    Size-bounded LRU cache with TTL.
+
+    Also prevents a cache stampede by allowing only one thread to populate
+    a given key at a time.
     """
 
-    def __init__(self, ttl: float, max_entries: int) -> None:
-        self._ttl = ttl
-        self._max_entries = max_entries
-        self._entries: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
-        self._lock = Lock()
+    def __init__(
+        self,
+        ttl: float,
+        max_entries: int,
+    ) -> None:
+        self.ttl = ttl
+        self.max_entries = max_entries
 
-    def get(self, key: str):
-        with self._lock:
-            hit = self._entries.get(key)
-            if hit and hit[0] > time.time():
-                self._entries.move_to_end(key)
-                return hit[1]
-            if hit:  # expired — drop it
-                self._entries.pop(key, None)
-        return None
+        self.entries: OrderedDict[
+            str,
+            tuple[float, bytes],
+        ] = OrderedDict()
+
+        self.loading: set[str] = set()
+
+        self.condition = Condition(Lock())
+
+    def get(self, key: str) -> bytes | None:
+        now = time.monotonic()
+
+        with self.condition:
+            item = self.entries.get(key)
+
+            if item is None:
+                return None
+
+            expires_at, body = item
+
+            if expires_at <= now:
+                self.entries.pop(key, None)
+                return None
+
+            self.entries.move_to_end(key)
+
+            return body
 
     def put(self, key: str, body: bytes) -> None:
-        with self._lock:
-            self._entries[key] = (time.time() + self._ttl, body)
-            self._entries.move_to_end(key)
-            while len(self._entries) > self._max_entries:
-                self._entries.popitem(last=False)
+        expires_at = time.monotonic() + self.ttl
 
+        with self.condition:
+            self.entries[key] = (
+                expires_at,
+                body,
+            )
 
-class _RateLimiter:
-    """Sliding-window request limiter, keyed per client (e.g. IP address).
+            self.entries.move_to_end(key)
 
-    Guards the paid upstream endpoint from being hammered by a single
-    misbehaving client. Not a substitute for a real edge/WAF rate limit in a
-    multi-instance deployment, but effective for a single-process server.
-    """
+            while len(self.entries) > self.max_entries:
+                self.entries.popitem(last=False)
 
-    def __init__(self, max_requests: int, window: float, sweep_interval: float) -> None:
-        self._max = max_requests
-        self._window = window
-        self._sweep_interval = sweep_interval
-        self._hits: dict[str, deque] = {}
-        self._lock = Lock()
-        self._next_sweep = time.time() + sweep_interval
+            self.loading.discard(key)
 
-    def allow(self, key: str) -> tuple[bool, float]:
-        """Returns (allowed, retry_after_seconds)."""
-        now = time.time()
-        with self._lock:
-            dq = self._hits.setdefault(key, deque())
-            cutoff = now - self._window
-            while dq and dq[0] <= cutoff:
-                dq.popleft()
+            self.condition.notify_all()
 
-            if len(dq) >= self._max:
-                retry_after = max(dq[0] + self._window - now, 0.0)
-                self._maybe_sweep(now)
-                return False, retry_after
-
-            dq.append(now)
-            self._maybe_sweep(now)
-            return True, 0.0
-
-    def _maybe_sweep(self, now: float) -> None:
-        """Drop empty buckets so one-off visitors don't accumulate forever.
-
-        Caller already holds `self._lock`.
+    def begin_load(self, key: str) -> bool:
         """
-        if now < self._next_sweep:
-            return
-        self._next_sweep = now + self._sweep_interval
-        cutoff = now - self._window
-        for key in [k for k, dq in self._hits.items() if not dq or dq[-1] <= cutoff]:
-            self._hits.pop(key, None)
+        Returns True if the caller should fetch from OpenWeather.
+
+        Returns False if another thread is already loading the same key.
+        """
+
+        with self.condition:
+            if key in self.loading:
+                return False
+
+            self.loading.add(key)
+            return True
+
+    def finish_load(self, key: str) -> None:
+        with self.condition:
+            self.loading.discard(key)
+            self.condition.notify_all()
+
+    def wait_for_load(self, key: str, timeout: float = 2.0) -> bytes | None:
+        """
+        Wait briefly for another request to populate the same cache key.
+        """
+
+        deadline = time.monotonic() + timeout
+
+        with self.condition:
+            while key in self.loading:
+                remaining = deadline - time.monotonic()
+
+                if remaining <= 0:
+                    break
+
+                self.condition.wait(timeout=remaining)
+
+            item = self.entries.get(key)
+
+            if item is None:
+                return None
+
+            expires_at, body = item
+
+            if expires_at <= time.monotonic():
+                self.entries.pop(key, None)
+                return None
+
+            self.entries.move_to_end(key)
+
+            return body
 
 
-STATIC_CACHE = _StaticCache()
-WEATHER_CACHE = _WeatherCache(WEATHER_TTL, WEATHER_CACHE_MAX_ENTRIES)
-WEATHER_RATE_LIMITER = _RateLimiter(
-    RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS, RATE_LIMIT_SWEEP_INTERVAL
+WEATHER_CACHE = WeatherCache(
+    WEATHER_TTL,
+    WEATHER_CACHE_MAX_ENTRIES,
 )
 
 
+# ============================================================================
+# Rate limiter
+# ============================================================================
+
+class RateLimiter:
+    """
+    Small in-process sliding-window limiter.
+
+    Important:
+        This is abuse protection, not a replacement for a WAF/reverse proxy.
+
+    We intentionally do NOT trust X-Forwarded-For here by default.
+    If you deploy behind a trusted proxy, configure that proxy to pass a
+    trustworthy client identifier and adapt this function accordingly.
+    """
+
+    def __init__(
+        self,
+        maximum: int,
+        window: float,
+        max_clients: int,
+        sweep_interval: float,
+    ) -> None:
+        self.maximum = maximum
+        self.window = window
+        self.max_clients = max_clients
+        self.sweep_interval = sweep_interval
+
+        self.hits: dict[str, deque[float]] = {}
+
+        self.lock = Lock()
+
+        self.next_sweep = (
+            time.monotonic() + sweep_interval
+        )
+
+    def allow(self, client: str) -> tuple[bool, float]:
+        now = time.monotonic()
+
+        with self.lock:
+            if len(self.hits) >= self.max_clients:
+                self._sweep(now)
+
+                if len(self.hits) >= self.max_clients:
+                    return False, self.window
+
+            bucket = self.hits.setdefault(
+                client,
+                deque(),
+            )
+
+            cutoff = now - self.window
+
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+
+            if len(bucket) >= self.maximum:
+                retry_after = max(
+                    bucket[0] + self.window - now,
+                    0.0,
+                )
+
+                self._sweep(now)
+
+                return False, retry_after
+
+            bucket.append(now)
+
+            self._sweep(now)
+
+            return True, 0.0
+
+    def _sweep(self, now: float) -> None:
+        if now < self.next_sweep:
+            return
+
+        self.next_sweep = now + self.sweep_interval
+
+        cutoff = now - self.window
+
+        stale = [
+            key
+            for key, bucket in self.hits.items()
+            if not bucket or bucket[-1] <= cutoff
+        ]
+
+        for key in stale:
+            self.hits.pop(key, None)
+
+
+RATE_LIMITER = RateLimiter(
+    RATE_LIMIT_MAX_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    RATE_LIMIT_MAX_CLIENTS,
+    RATE_LIMIT_SWEEP_INTERVAL,
+)
+
+
+# ============================================================================
+# HTTP handler
+# ============================================================================
+
 class SkyCastHandler(BaseHTTPRequestHandler):
-    server_version = "SkyCast"
-    # HTTP/1.1 enables keep-alive so the browser reuses one connection for
-    # the whole page load. Safe here because every response we send carries
-    # an accurate Content-Length (or is an explicit 304).
+
     protocol_version = "HTTP/1.1"
 
-    # Don't advertise the runtime. BaseHTTPRequestHandler normally appends
-    # "Python/3.x.y" to the Server header, which leaks implementation
-    # details; return a single opaque token instead.
-    def version_string(self) -> str:  # noqa: D401 (stdlib override)
+    server_version = "SkyCast"
+
+    # ----------------------------------------------------------------------
+    # Server information
+    # ----------------------------------------------------------------------
+
+    def version_string(self) -> str:
         return self.server_version
 
+    # ----------------------------------------------------------------------
+    # Security headers
+    # ----------------------------------------------------------------------
+
     def end_headers(self) -> None:
-        # Baseline hardening headers applied to every response.
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("X-Frame-Options", "DENY")
-        # Only this origin may load scripts/styles; the weather icon CDN is
-        # the sole cross-origin resource the page needs, and only for images.
-        # connect-src also allow-lists it (some browsers gate <link
-        # rel="preconnect"> on connect-src), so the page's early-connection
-        # hint to that CDN isn't silently dropped.
+
         self.send_header(
-            "Content-Security-Policy",
-            "default-src 'self'; "
-            "img-src 'self' https://openweathermap.org data:; "
-            "style-src 'self'; "
-            "script-src 'self'; "
-            "connect-src 'self' https://openweathermap.org; "
-            "base-uri 'none'; "
-            "form-action 'self'; "
-            "frame-ancestors 'none'",
+            "X-Content-Type-Options",
+            "nosniff",
         )
-        # The app only ever needs its own geolocation prompt; deny every
-        # other sensitive browser capability by default.
+
+        self.send_header(
+            "X-Frame-Options",
+            "DENY",
+        )
+
+        self.send_header(
+            "Referrer-Policy",
+            "no-referrer",
+        )
+
         self.send_header(
             "Permissions-Policy",
             "geolocation=(self), camera=(), microphone=(), payment=()",
         )
+
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "img-src 'self' data: https://openweathermap.org; "
+            "style-src 'self'; "
+            "script-src 'self'; "
+            "connect-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'none'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'",
+        )
+
         super().end_headers()
 
-    # ----- low-level body writer ------------------------------------------ #
-    def _client_accepts_gzip(self) -> bool:
-        return "gzip" in self.headers.get("Accept-Encoding", "").lower()
+    # ----------------------------------------------------------------------
+    # Request helpers
+    # ----------------------------------------------------------------------
 
-    def _client_ip(self) -> str:
-        """Best-effort client identifier for rate limiting.
-
-        Trusts X-Forwarded-For when present (Render and most PaaS proxies
-        set it) so limits apply per real visitor rather than per shared
-        proxy connection. This is only used for coarse abuse mitigation, not
-        as a security boundary, so a spoofed header merely lets a client
-        evade its own limit rather than anyone else's.
+    def client_identifier(self) -> str:
         """
-        forwarded = self.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
+        Use the actual TCP peer by default.
+
+        Do not blindly trust X-Forwarded-For because clients can spoof it
+        when the application is directly reachable.
+        """
+
         return self.client_address[0]
 
-    def _send_body(
+    def accepts_gzip(self) -> bool:
+        encoding = self.headers.get(
+            "Accept-Encoding",
+            "",
+        )
+
+        return "gzip" in encoding.lower()
+
+    # ----------------------------------------------------------------------
+    # Response helpers
+    # ----------------------------------------------------------------------
+
+    def send_body(
         self,
         status: int,
         body: bytes,
         content_type: str,
         *,
-        gz: bytes | None = None,
-        extra_headers: dict | None = None,
+        gzip_body: bytes | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        """Send a full response, gzipping compressible bodies when possible.
 
-        `gz` is a precomputed gzip copy (from the static cache); when absent
-        we compress on the fly for compressible types.
-        """
-        use_gzip = self._client_accepts_gzip() and content_type in COMPRESSIBLE
-        if use_gzip and gz is None and len(body) >= GZIP_MIN_BYTES:
-            gz = gzip.compress(body, compresslevel=6)
-        payload = gz if (use_gzip and gz is not None) else body
-        encoded = use_gzip and gz is not None
-
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        if content_type in COMPRESSIBLE:
-            # Caches must key on encoding since we vary the body by it.
-            self.send_header("Vary", "Accept-Encoding")
-        if encoded:
-            self.send_header("Content-Encoding", "gzip")
-        for name, value in (extra_headers or {}).items():
-            self.send_header(name, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(payload)
-
-    # ----- JSON helpers --------------------------------------------------- #
-    def _send_json(
-        self, status: int, payload: dict, *, extra_headers: dict | None = None
-    ) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        headers = {"Cache-Control": "no-store"}
-        headers.update(extra_headers or {})
-        self._send_body(
-            status,
-            body,
-            "application/json; charset=utf-8",
-            extra_headers=headers,
+        use_gzip = (
+            self.accepts_gzip()
+            and content_type in COMPRESSIBLE
         )
 
-    def _send_error_json(
-        self, status: int, message: str, *, extra_headers: dict | None = None
+        if use_gzip and gzip_body is None and len(body) >= GZIP_MIN_BYTES:
+            gzip_body = gzip.compress(
+                body,
+                compresslevel=6,
+            )
+
+        payload = (
+            gzip_body
+            if use_gzip and gzip_body is not None
+            else body
+        )
+
+        encoded = (
+            use_gzip
+            and gzip_body is not None
+        )
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            content_type,
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(payload)),
+        )
+
+        if content_type in COMPRESSIBLE:
+            self.send_header(
+                "Vary",
+                "Accept-Encoding",
+            )
+
+        if encoded:
+            self.send_header(
+                "Content-Encoding",
+                "gzip",
+            )
+
+        if headers:
+            for name, value in headers.items():
+                self.send_header(
+                    name,
+                    value,
+                )
+
+        self.end_headers()
+
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # Client disappeared while receiving the response.
+                pass
+
+    def send_json(
+        self,
+        status: int,
+        payload: dict,
+        *,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        self._send_json(status, {"error": message}, extra_headers=extra_headers)
 
-    # ----- routing -------------------------------------------------------- #
-    def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+        response_headers = {
+            "Cache-Control": "no-store",
+        }
+
+        if headers:
+            response_headers.update(headers)
+
+        self.send_body(
+            status,
+            json_bytes(payload),
+            "application/json; charset=utf-8",
+            headers=response_headers,
+        )
+
+    def send_error_json(
+        self,
+        status: int,
+        message: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+
+        self.send_json(
+            status,
+            {"error": message},
+            headers=headers,
+        )
+
+    # ----------------------------------------------------------------------
+    # Routing
+    # ----------------------------------------------------------------------
+
+    def do_GET(self) -> None:
+
         parsed = urlparse(self.path)
-        path = parsed.path
 
-        if path == "/api/weather":
-            self.handle_weather(parse_qs(parsed.query))
-        else:
-            self.serve_static(path)
+        if len(self.path) > MAX_QUERY_LENGTH + 128:
+            self.send_error_json(
+                414,
+                "Request URI is too long.",
+            )
+            return
 
-    # HEAD support falls out for free — reuse GET routing; _send_body skips
-    # the body when the method is HEAD.
+        if parsed.path == "/api/weather":
+            self.handle_weather(
+                parse_qs(
+                    parsed.query,
+                    keep_blank_values=False,
+                    strict_parsing=False,
+                )
+            )
+            return
+
+        self.serve_static(parsed.path)
+
     do_HEAD = do_GET
 
-    # ----- /api/weather --------------------------------------------------- #
-    def handle_weather(self, query: dict) -> None:
-        allowed, retry_after = WEATHER_RATE_LIMITER.allow(self._client_ip())
+    # ----------------------------------------------------------------------
+    # Weather API
+    # ----------------------------------------------------------------------
+
+    def handle_weather(self, query: dict[str, list[str]]) -> None:
+
+        allowed, retry_after = RATE_LIMITER.allow(
+            self.client_identifier()
+        )
+
         if not allowed:
-            self._send_error_json(
+            self.send_error_json(
                 429,
                 "Too many requests. Please wait a moment and try again.",
-                extra_headers={"Retry-After": str(int(retry_after) + 1)},
+                headers={
+                    "Retry-After": str(
+                        max(1, int(retry_after) + 1)
+                    )
+                },
             )
             return
 
         if not API_KEY:
-            self._send_error_json(
+            self.send_error_json(
                 500,
-                "Server is missing OPENWEATHER_API_KEY. Copy .env.example to "
-                ".env and add your key, then restart the server.",
+                "Weather service is not configured.",
             )
             return
 
-        # Build the upstream query from a strict allow-list of parameters.
-        params = {"appid": API_KEY, "units": "metric"}
+        city = query.get("city", [""])[0].strip()
 
-        city = (query.get("city", [""])[0]).strip()
-        lat_raw = (query.get("lat", [""])[0]).strip()
-        lon_raw = (query.get("lon", [""])[0]).strip()
+        lat_raw = query.get(
+            "lat",
+            [""],
+        )[0].strip()
+
+        lon_raw = query.get(
+            "lon",
+            [""],
+        )[0].strip()
+
+        # ------------------------------------------------------------------
+        # City lookup
+        # ------------------------------------------------------------------
 
         if city:
+
             if len(city) > MAX_CITY_LENGTH:
-                self._send_error_json(
-                    400, f"City name must be {MAX_CITY_LENGTH} characters or fewer."
+                self.send_error_json(
+                    400,
+                    f"City name must be {MAX_CITY_LENGTH} characters or fewer.",
                 )
                 return
-            params["q"] = city
-            cache_key = f"city:{city.lower()}"
+
+            city = " ".join(city.split())
+
+            cache_key = (
+                "city:"
+                + normalize_city(city)
+            )
+
+            upstream_params = {
+                "q": city,
+                "appid": API_KEY,
+                "units": "metric",
+            }
+
+        # ------------------------------------------------------------------
+        # Coordinate lookup
+        # ------------------------------------------------------------------
+
         elif lat_raw and lon_raw:
+
             try:
-                lat, lon = float(lat_raw), float(lon_raw)
-            except ValueError:
-                self._send_error_json(400, "'lat' and 'lon' must be numbers.")
-                return
-            if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
-                self._send_error_json(
-                    400, "'lat' must be within -90..90 and 'lon' within -180..180."
+                lat = float(lat_raw)
+                lon = float(lon_raw)
+            except (ValueError, TypeError):
+                self.send_error_json(
+                    400,
+                    "Latitude and longitude must be valid numbers.",
                 )
                 return
-            params["lat"] = lat_raw
-            params["lon"] = lon_raw
-            cache_key = f"coord:{lat},{lon}"
+
+            if not (
+                valid_coordinate(lat, -90.0, 90.0)
+                and valid_coordinate(lon, -180.0, 180.0)
+            ):
+                self.send_error_json(
+                    400,
+                    "Coordinates are outside the valid range.",
+                )
+                return
+
+            # Normalize floating-point representations so:
+            # 28.5 and 028.5000 become the same cache key.
+            lat = round(lat, 4)
+            lon = round(lon, 4)
+
+            cache_key = f"coord:{lat:.4f},{lon:.4f}"
+
+            upstream_params = {
+                "lat": f"{lat:.4f}",
+                "lon": f"{lon:.4f}",
+                "appid": API_KEY,
+                "units": "metric",
+            }
+
         else:
-            self._send_error_json(
-                400, "Provide a 'city' or both 'lat' and 'lon' parameters."
+
+            self.send_error_json(
+                400,
+                "Provide either a city or both latitude and longitude.",
             )
             return
 
-        # Serve a fresh-enough cached payload without touching the network.
+        # ------------------------------------------------------------------
+        # Cache
+        # ------------------------------------------------------------------
+
         cached = WEATHER_CACHE.get(cache_key)
+
         if cached is not None:
-            self._send_body(
+            self.send_body(
                 200,
                 cached,
                 "application/json; charset=utf-8",
-                extra_headers={"Cache-Control": "no-store", "X-Cache": "HIT"},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Cache": "HIT",
+                },
             )
             return
 
-        url = f"{OWM_BASE}?{urlencode(params)}"
+        # ------------------------------------------------------------------
+        # Prevent cache stampede
+        # ------------------------------------------------------------------
+
+        should_load = WEATHER_CACHE.begin_load(
+            cache_key
+        )
+
+        if not should_load:
+
+            cached = WEATHER_CACHE.wait_for_load(
+                cache_key
+            )
+
+            if cached is not None:
+                self.send_body(
+                    200,
+                    cached,
+                    "application/json; charset=utf-8",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Cache": "COALESCED",
+                    },
+                )
+                return
+
+            # Another request is taking too long.
+            self.send_error_json(
+                503,
+                "Weather service is busy. Please try again.",
+                headers={
+                    "Retry-After": "2",
+                },
+            )
+            return
 
         try:
-            req = Request(url, headers={"User-Agent": "SkyCast/1.0"})
-            with urlopen(req, timeout=10) as resp:
-                body = resp.read()
-            # Validate it's JSON before caching/forwarding.
-            json.loads(body.decode("utf-8"))
-            WEATHER_CACHE.put(cache_key, body)
-            self._send_body(
+            self.fetch_weather(
+                cache_key,
+                upstream_params,
+            )
+        finally:
+            WEATHER_CACHE.finish_load(
+                cache_key
+            )
+
+    def fetch_weather(
+        self,
+        cache_key: str,
+        params: dict[str, str],
+    ) -> None:
+
+        url = (
+            f"{OWM_BASE}?"
+            f"{urlencode(params)}"
+        )
+
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "SkyCast/1.0",
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+
+            with urlopen(
+                request,
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            ) as response:
+
+                content_length = response.headers.get(
+                    "Content-Length"
+                )
+
+                if content_length:
+                    try:
+                        declared_size = int(
+                            content_length
+                        )
+                    except ValueError:
+                        declared_size = 0
+
+                    if declared_size > MAX_UPSTREAM_RESPONSE_BYTES:
+                        self.send_error_json(
+                            502,
+                            "Weather service returned an unexpectedly large response.",
+                        )
+                        return
+
+                chunks: list[bytes] = []
+                total = 0
+
+                while True:
+
+                    chunk = response.read(8192)
+
+                    if not chunk:
+                        break
+
+                    total += len(chunk)
+
+                    if total > MAX_UPSTREAM_RESPONSE_BYTES:
+                        self.send_error_json(
+                            502,
+                            "Weather service response was too large.",
+                        )
+                        return
+
+                    chunks.append(chunk)
+
+                body = b"".join(chunks)
+
+            # Verify JSON before putting anything into the cache.
+            try:
+                json.loads(
+                    body.decode("utf-8")
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+            ):
+                self.send_error_json(
+                    502,
+                    "Weather service returned invalid data.",
+                )
+                return
+
+            WEATHER_CACHE.put(
+                cache_key,
+                body,
+            )
+
+            self.send_body(
                 200,
                 body,
                 "application/json; charset=utf-8",
-                extra_headers={"Cache-Control": "no-store", "X-Cache": "MISS"},
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Cache": "MISS",
+                },
             )
 
-        except HTTPError as err:
-            # Translate upstream errors into friendly, key-free messages.
-            if err.code == 404:
-                self._send_error_json(
-                    404, "City not found. Check the spelling and try again."
+        except HTTPError as exc:
+
+            if exc.code == 404:
+                self.send_error_json(
+                    404,
+                    "City not found. Check the spelling and try again.",
                 )
-            elif err.code in (401, 403):
-                self._send_error_json(
+                return
+
+            if exc.code in (401, 403):
+                self.send_error_json(
                     502,
-                    "Weather service rejected the API key. Verify the key in "
-                    ".env is correct and activated.",
+                    "Weather service authentication failed.",
                 )
-            else:
-                self._send_error_json(
-                    502, f"Weather service error (HTTP {err.code})."
-                )
+                return
 
-        except (URLError, TimeoutError):
-            self._send_error_json(
+            if 400 <= exc.code < 500:
+                self.send_error_json(
+                    502,
+                    "Weather service rejected the request.",
+                )
+                return
+
+            self.send_error_json(
                 502,
-                "Could not reach the weather service. Check your internet "
-                "connection and try again.",
+                "Weather service is temporarily unavailable.",
             )
-        except Exception:  # noqa: BLE001 — last-resort guard
-            self._send_error_json(500, "Unexpected server error.")
 
-    # ----- static files -------------------------------------------------- #
-    def _not_modified(self, entry: dict) -> bool:
-        """True if the client's cached copy of `entry` is still current."""
-        inm = self.headers.get("If-None-Match")
-        if inm and entry["etag"] in [t.strip() for t in inm.split(",")]:
+        except (
+            URLError,
+            TimeoutError,
+            ConnectionError,
+        ):
+            self.send_error_json(
+                502,
+                "Could not reach the weather service.",
+            )
+
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+        ):
+            pass
+
+        except Exception:
+            # Never expose stack traces or implementation details.
+            self.send_error_json(
+                500,
+                "Unexpected server error.",
+            )
+
+    # ----------------------------------------------------------------------
+    # Static files
+    # ----------------------------------------------------------------------
+
+    def is_allowed_static_path(
+        self,
+        relative: str,
+    ) -> bool:
+
+        parts = relative.split("/")
+
+        if any(
+            part in {
+                "",
+                ".",
+                "..",
+            }
+            for part in parts
+        ):
+            return False
+
+        if (
+            len(parts) == 1
+            and parts[0] in STATIC_ROOT_FILES
+        ):
             return True
-        ims = self.headers.get("If-Modified-Since")
-        if ims:
-            try:
-                since = parsedate_to_datetime(ims)
-                last = parsedate_to_datetime(entry["last_modified"])
-                if since is not None and last is not None and last <= since:
-                    return True
-            except (TypeError, ValueError):
-                pass
+
+        if (
+            len(parts) >= 2
+            and parts[0] in STATIC_DIRS
+        ):
+            return True
+
         return False
 
-    def serve_static(self, path: str) -> None:
+    def serve_static(
+        self,
+        path: str,
+    ) -> None:
+
         if path == "/":
             path = "/index.html"
 
-        rel = path.lstrip("/")
-        parts = rel.split("/")
+        relative = path.lstrip("/")
 
-        # Allow-list: only index.html (and favicon) at the root, or files
-        # inside css/ and js/. This guarantees .env, server.py, .git, etc.
-        # can never be served, no matter what the client requests.
-        allowed = (
-            (len(parts) == 1 and parts[0] in STATIC_ROOT_FILES)
-            or (len(parts) > 1 and parts[0] in STATIC_DIRS)
-        )
-        if not allowed or any(p in ("", "..", ".") for p in parts):
-            self._send_error_json(404, "Not found.")
+        if not self.is_allowed_static_path(
+            relative
+        ):
+            self.send_error_json(
+                404,
+                "Not found.",
+            )
             return
 
-        # Resolve against BASE_DIR and refuse anything that escapes it.
-        target = (BASE_DIR / rel).resolve()
+        target = (
+            BASE_DIR / relative
+        ).resolve()
+
+        # Defense in depth against path traversal/symlink escapes.
         try:
-            target.relative_to(BASE_DIR)
+            target.relative_to(
+                BASE_DIR
+            )
         except ValueError:
-            self._send_error_json(403, "Forbidden.")
+            self.send_error_json(
+                403,
+                "Forbidden.",
+            )
             return
 
-        entry = STATIC_CACHE.get(target)
+        entry = STATIC_CACHE.get(
+            target
+        )
+
         if entry is None:
-            self._send_error_json(404, "Not found.")
+            self.send_error_json(
+                404,
+                "Not found.",
+            )
             return
 
-        # Validators + a modest cache window. Filenames aren't content-hashed,
-        # so we keep max-age short and let the ETag revalidate the rest.
-        validators = {
+        headers = {
             "ETag": entry["etag"],
             "Last-Modified": entry["last_modified"],
-            "Cache-Control": "public, max-age=300",
+            "Cache-Control": (
+                f"public, max-age={STATIC_CACHE_SECONDS}"
+            ),
         }
 
-        if self._not_modified(entry):
-            self.send_response(304)
-            for name, value in validators.items():
-                self.send_header(name, value)
+        if self.not_modified(
+            entry
+        ):
+            self.send_response(
+                304
+            )
+
+            for name, value in headers.items():
+                self.send_header(
+                    name,
+                    value,
+                )
+
             self.end_headers()
             return
 
-        self._send_body(
+        self.send_body(
             200,
             entry["raw"],
             entry["content_type"],
-            gz=entry["gz"],
-            extra_headers=validators,
+            gzip_body=entry["gz"],
+            headers=headers,
         )
 
-    # Quieter, tidier logging.
-    def log_message(self, fmt: str, *args) -> None:
+    def not_modified(
+        self,
+        entry: dict,
+    ) -> bool:
+
+        etag = self.headers.get(
+            "If-None-Match"
+        )
+
+        if etag:
+            candidates = {
+                item.strip()
+                for item in etag.split(",")
+            }
+
+            if entry["etag"] in candidates:
+                return True
+
+        modified = self.headers.get(
+            "If-Modified-Since"
+        )
+
+        if modified:
+
+            try:
+                client_time = parsedate_to_datetime(
+                    modified
+                )
+
+                server_time = parsedate_to_datetime(
+                    entry["last_modified"]
+                )
+
+                if (
+                    client_time
+                    and server_time
+                    and server_time <= client_time
+                ):
+                    return True
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        return False
+
+    # ----------------------------------------------------------------------
+    # Logging
+    # ----------------------------------------------------------------------
+
+    def log_message(
+        self,
+        fmt: str,
+        *args,
+    ) -> None:
+
         sys.stderr.write(
-            f"  {self.address_string()} - {fmt % args}\n"
+            f"{self.client_address[0]} "
+            f"- {fmt % args}\n"
         )
 
+
+# ============================================================================
+# Startup
+# ============================================================================
 
 def main() -> None:
-    if not (BASE_DIR / "index.html").is_file():
-        print(f"ERROR: index.html not found at {BASE_DIR}", file=sys.stderr)
-        sys.exit(1)
 
-    banner = "  SkyCast is running!"
-    print("=" * 52)
-    print(banner)
-    print("=" * 52)
-    print(f"  Open:  http://localhost:{PORT}")
-    if not API_KEY:
-        print("  WARNING: OPENWEATHER_API_KEY is not set.")
-        print("           Copy .env.example to .env and add your key.")
-    print("  Press Ctrl+C to stop.")
-    print("=" * 52)
+    if not (
+        BASE_DIR / "index.html"
+    ).is_file():
 
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), SkyCastHandler)
+        print(
+            "ERROR: index.html was not found at "
+            f"{BASE_DIR}",
+            file=sys.stderr,
+        )
+
+        raise SystemExit(1)
+
+    print("=" * 56)
+    print(" SkyCast server")
+    print("=" * 56)
+    print(
+        f" URL: http://localhost:{PORT}"
+    )
+
+    if API_KEY:
+        print(
+            " OpenWeather API key: configured"
+        )
+    else:
+        print(
+            " WARNING: OpenWeather API key is not configured."
+        )
+        print(
+            " Set OPENWEATHER_API_KEY in the environment or .env."
+        )
+
+    print(
+        " Press Ctrl+C to stop."
+    )
+    print("=" * 56)
+
+    server = ThreadingHTTPServer(
+        (HOST, PORT),
+        SkyCastHandler,
+    )
+
     try:
         server.serve_forever()
+
     except KeyboardInterrupt:
-        print("\n  SkyCast stopped. Bye!")
+        print(
+            "\nSkyCast stopped."
+        )
+
+    finally:
         server.server_close()
 
 
 if __name__ == "__main__":
     main()
+```
