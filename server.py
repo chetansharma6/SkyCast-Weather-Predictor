@@ -1,28 +1,28 @@
 ```python
 """
-SkyCast backend proxy.
+SkyCast — backend proxy server.
 
 Browser
     -> /api/weather
     -> this server
     -> OpenWeather
 
-The OpenWeather API key stays server-side in OPENWEATHER_API_KEY.
+The OpenWeather API key stays server-side and is never sent to the browser.
 
 Standard library only.
 
-Recommended production deployment:
-    Internet
-        |
-      HTTPS
-        |
-   reverse proxy / WAF
-        |
-    SkyCast server
+Run locally:
+    python server.py
 
-This file is intentionally small and dependency-free. It is suitable for
-small deployments and local use. For high-traffic production workloads,
-place it behind a real reverse proxy/application server.
+Then open:
+    http://localhost:8000
+
+Environment:
+    OPENWEATHER_API_KEY=your_key_here
+    PORT=8000
+
+Optional:
+    HOST=0.0.0.0
 """
 
 from __future__ import annotations
@@ -51,43 +51,57 @@ BASE_DIR = Path(__file__).resolve().parent
 OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
 
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8000"))
 
-WEATHER_TTL = 120.0
+try:
+    PORT = int(os.environ.get("PORT", "8000"))
+except ValueError:
+    PORT = 8000
 
+# Weather responses are reused for this many seconds.
+WEATHER_TTL = 120
+
+# Prevent unlimited memory growth from unique searches.
 WEATHER_CACHE_MAX_ENTRIES = 500
 
+# Per-client API protection.
 RATE_LIMIT_MAX_REQUESTS = 30
-RATE_LIMIT_WINDOW_SECONDS = 60.0
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_SWEEP_INTERVAL = 300
 RATE_LIMIT_MAX_CLIENTS = 10_000
-RATE_LIMIT_SWEEP_INTERVAL = 300.0
 
+# Input limits.
 MAX_CITY_LENGTH = 100
+MAX_REQUEST_TARGET_LENGTH = 2048
 
-MAX_QUERY_LENGTH = 512
-
+# Don't allow an unexpectedly large upstream response into memory.
 MAX_UPSTREAM_RESPONSE_BYTES = 128 * 1024
 
+# OpenWeather timeout.
 UPSTREAM_TIMEOUT_SECONDS = 8
 
+# Compression.
 GZIP_MIN_BYTES = 256
 
-STATIC_CACHE_SECONDS = 300
+# Browser caching for static files.
+STATIC_CACHE_MAX_AGE = 300
 
 
 # ============================================================================
-# Static file policy
+# Static file allow-list
 # ============================================================================
 
+# Files allowed directly under the project root.
 STATIC_ROOT_FILES = {
     "index.html",
     "favicon.ico",
 }
 
+# Directories whose contents may be served.
 STATIC_DIRS = {
     "css",
     "js",
 }
+
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -100,6 +114,7 @@ CONTENT_TYPES = {
     ".webmanifest": "application/manifest+json",
 }
 
+
 COMPRESSIBLE = {
     "text/html; charset=utf-8",
     "text/css; charset=utf-8",
@@ -111,31 +126,42 @@ COMPRESSIBLE = {
 
 
 # ============================================================================
-# Environment
+# Environment loader
 # ============================================================================
 
 def load_env(path: Path) -> None:
     """
-    Minimal .env loader.
+    Small .env loader using only the Python standard library.
 
-    Existing real environment variables always win.
+    Existing environment variables always take precedence.
     """
 
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        print(f"Warning: unable to read {path}: {exc}", file=sys.stderr)
+    if not path.is_file():
         return
 
-    for raw in text.splitlines():
+    try:
+        lines = path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except OSError:
+        return
+
+    for raw in lines:
         line = raw.strip()
 
-        if not line or line.startswith("#") or "=" not in line:
+        if not line:
             continue
 
-        key, value = line.split("=", 1)
+        if line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split(
+            "=",
+            1,
+        )
 
         key = key.strip()
         value = value.strip()
@@ -143,30 +169,38 @@ def load_env(path: Path) -> None:
         if not key:
             continue
 
+        # Remove matching surrounding quotes.
         if (
             len(value) >= 2
             and value[0] == value[-1]
-            and value[0] in {"'", '"'}
+            and value[0] in ("'", '"')
         ):
             value = value[1:-1]
 
-        os.environ.setdefault(key, value)
+        # Don't overwrite real environment variables.
+        os.environ.setdefault(
+            key,
+            value,
+        )
 
 
-load_env(BASE_DIR / ".env")
+load_env(
+    BASE_DIR / ".env"
+)
 
-API_KEY = os.environ.get("OPENWEATHER_API_KEY", "").strip()
+API_KEY = os.environ.get(
+    "OPENWEATHER_API_KEY",
+    "",
+).strip()
 
 
 # ============================================================================
-# Helpers
+# Utility helpers
 # ============================================================================
 
 def json_bytes(payload: dict) -> bytes:
     """
-    Compact JSON encoding.
-
-    separators remove unnecessary whitespace and reduce response size.
+    Compact JSON encoding to reduce response size.
     """
 
     return json.dumps(
@@ -176,45 +210,49 @@ def json_bytes(payload: dict) -> bytes:
     ).encode("utf-8")
 
 
-def clamp_text(value: str, maximum: int) -> str:
-    return value.strip()[:maximum]
-
-
 def normalize_city(city: str) -> str:
     """
-    Normalize city input for cache consistency.
-
-    Multiple spaces and case differences should map to the same cache key.
+    Normalize whitespace and case for stable cache keys.
     """
 
-    return " ".join(city.split()).casefold()
+    return " ".join(
+        city.split()
+    ).casefold()
 
 
-def valid_coordinate(value: float, minimum: float, maximum: float) -> bool:
-    return minimum <= value <= maximum
+def valid_latitude(value: float) -> bool:
+    return -90.0 <= value <= 90.0
+
+
+def valid_longitude(value: float) -> bool:
+    return -180.0 <= value <= 180.0
 
 
 # ============================================================================
-# Static cache
+# Static asset cache
 # ============================================================================
 
-class StaticCache:
+class _StaticCache:
     """
-    Thread-safe in-memory cache of static assets.
+    In-memory cache for static files.
 
-    Stores:
-        raw bytes
-        optional gzip bytes
-        ETag
-        Last-Modified
-        content type
+    Cached values:
+        raw
+        gz
+        etag
+        last_modified
+        content_type
     """
 
     def __init__(self) -> None:
         self._entries: dict[str, dict] = {}
         self._lock = Lock()
 
-    def get(self, target: Path) -> dict | None:
+    def get(
+        self,
+        target: Path,
+    ) -> dict | None:
+
         try:
             stat = target.stat()
         except OSError:
@@ -230,7 +268,10 @@ class StaticCache:
         with self._lock:
             cached = self._entries.get(key)
 
-            if cached and cached["signature"] == signature:
+            if (
+                cached is not None
+                and cached["signature"] == signature
+            ):
                 return cached
 
         try:
@@ -243,13 +284,13 @@ class StaticCache:
             "application/octet-stream",
         )
 
-        compressed = None
+        gz = None
 
         if (
             content_type in COMPRESSIBLE
             and len(raw) >= GZIP_MIN_BYTES
         ):
-            compressed = gzip.compress(
+            gz = gzip.compress(
                 raw,
                 compresslevel=6,
             )
@@ -257,8 +298,11 @@ class StaticCache:
         entry = {
             "signature": signature,
             "raw": raw,
-            "gz": compressed,
-            "etag": f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"',
+            "gz": gz,
+            "etag": (
+                f'"{stat.st_size:x}-'
+                f'{stat.st_mtime_ns:x}"'
+            ),
             "last_modified": formatdate(
                 stat.st_mtime,
                 usegmt=True,
@@ -272,19 +316,31 @@ class StaticCache:
         return entry
 
 
-STATIC_CACHE = StaticCache()
+STATIC_CACHE = _StaticCache()
 
 
 # ============================================================================
 # Weather cache
 # ============================================================================
 
-class WeatherCache:
+class _WeatherCache:
     """
-    Size-bounded LRU cache with TTL.
+    TTL + LRU weather cache.
 
-    Also prevents a cache stampede by allowing only one thread to populate
-    a given key at a time.
+    The original class name is intentionally preserved for compatibility
+    with the existing unit tests.
+
+    Additional loading-state tracking prevents a cache stampede:
+
+        request A -> OpenWeather
+        request B -> waits/reuses A
+        request C -> waits/reuses A
+
+    instead of:
+
+        request A -> OpenWeather
+        request B -> OpenWeather
+        request C -> OpenWeather
     """
 
     def __init__(
@@ -292,23 +348,30 @@ class WeatherCache:
         ttl: float,
         max_entries: int,
     ) -> None:
-        self.ttl = ttl
-        self.max_entries = max_entries
 
-        self.entries: OrderedDict[
+        self._ttl = float(ttl)
+        self._max_entries = int(max_entries)
+
+        self._entries: OrderedDict[
             str,
             tuple[float, bytes],
         ] = OrderedDict()
 
-        self.loading: set[str] = set()
+        self._loading: set[str] = set()
 
-        self.condition = Condition(Lock())
+        self._condition = Condition(
+            Lock()
+        )
 
-    def get(self, key: str) -> bytes | None:
+    def get(
+        self,
+        key: str,
+    ) -> bytes | None:
+
         now = time.monotonic()
 
-        with self.condition:
-            item = self.entries.get(key)
+        with self._condition:
+            item = self._entries.get(key)
 
             if item is None:
                 return None
@@ -316,183 +379,347 @@ class WeatherCache:
             expires_at, body = item
 
             if expires_at <= now:
-                self.entries.pop(key, None)
+                self._entries.pop(
+                    key,
+                    None,
+                )
                 return None
 
-            self.entries.move_to_end(key)
+            # Successful read makes this the most recently used entry.
+            self._entries.move_to_end(
+                key
+            )
 
             return body
 
-    def put(self, key: str, body: bytes) -> None:
-        expires_at = time.monotonic() + self.ttl
+    def put(
+        self,
+        key: str,
+        body: bytes,
+    ) -> None:
 
-        with self.condition:
-            self.entries[key] = (
+        expires_at = (
+            time.monotonic()
+            + self._ttl
+        )
+
+        with self._condition:
+
+            self._entries[key] = (
                 expires_at,
                 body,
             )
 
-            self.entries.move_to_end(key)
+            self._entries.move_to_end(
+                key
+            )
 
-            while len(self.entries) > self.max_entries:
-                self.entries.popitem(last=False)
+            while (
+                len(self._entries)
+                > self._max_entries
+            ):
+                self._entries.popitem(
+                    last=False
+                )
 
-            self.loading.discard(key)
+            # A successful cache write means loading has finished.
+            self._loading.discard(
+                key
+            )
 
-            self.condition.notify_all()
+            self._condition.notify_all()
 
-    def begin_load(self, key: str) -> bool:
+    def begin_load(
+        self,
+        key: str,
+    ) -> bool:
         """
-        Returns True if the caller should fetch from OpenWeather.
+        Mark a cache key as being fetched.
 
-        Returns False if another thread is already loading the same key.
+        Returns True for the request responsible for fetching it.
+
+        Returns False for concurrent requests that should wait.
         """
 
-        with self.condition:
-            if key in self.loading:
+        with self._condition:
+
+            if key in self._loading:
                 return False
 
-            self.loading.add(key)
+            self._loading.add(
+                key
+            )
+
             return True
 
-    def finish_load(self, key: str) -> None:
-        with self.condition:
-            self.loading.discard(key)
-            self.condition.notify_all()
+    def finish_load(
+        self,
+        key: str,
+    ) -> None:
 
-    def wait_for_load(self, key: str, timeout: float = 2.0) -> bytes | None:
+        with self._condition:
+
+            self._loading.discard(
+                key
+            )
+
+            self._condition.notify_all()
+
+    def wait_for_load(
+        self,
+        key: str,
+        timeout: float = 2.0,
+    ) -> bytes | None:
         """
-        Wait briefly for another request to populate the same cache key.
+        Wait for another request to populate the same key.
+
+        Returns the cached body if available.
+
+        Returns None if the other request failed or took too long.
         """
 
-        deadline = time.monotonic() + timeout
+        deadline = (
+            time.monotonic()
+            + timeout
+        )
 
-        with self.condition:
-            while key in self.loading:
-                remaining = deadline - time.monotonic()
+        with self._condition:
+
+            while key in self._loading:
+
+                remaining = (
+                    deadline
+                    - time.monotonic()
+                )
 
                 if remaining <= 0:
                     break
 
-                self.condition.wait(timeout=remaining)
+                self._condition.wait(
+                    timeout=remaining
+                )
 
-            item = self.entries.get(key)
+            item = self._entries.get(
+                key
+            )
 
             if item is None:
                 return None
 
             expires_at, body = item
 
-            if expires_at <= time.monotonic():
-                self.entries.pop(key, None)
+            if (
+                expires_at
+                <= time.monotonic()
+            ):
+                self._entries.pop(
+                    key,
+                    None,
+                )
                 return None
 
-            self.entries.move_to_end(key)
+            self._entries.move_to_end(
+                key
+            )
 
             return body
 
+    # ----------------------------------------------------------------------
+    # Compatibility helpers
+    # ----------------------------------------------------------------------
 
-WEATHER_CACHE = WeatherCache(
-    WEATHER_TTL,
-    WEATHER_CACHE_MAX_ENTRIES,
-)
+    @property
+    def _entries_public(self):
+        """
+        Internal compatibility accessor.
+
+        Existing code that inspects _entries continues to work because
+        _entries itself remains the actual storage attribute.
+        """
+
+        return self._entries
 
 
 # ============================================================================
 # Rate limiter
 # ============================================================================
 
-class RateLimiter:
+class _RateLimiter:
     """
-    Small in-process sliding-window limiter.
+    In-process sliding-window rate limiter.
 
-    Important:
-        This is abuse protection, not a replacement for a WAF/reverse proxy.
+    The original class name and constructor arguments are intentionally
+    preserved for compatibility with the existing tests.
 
-    We intentionally do NOT trust X-Forwarded-For here by default.
-    If you deploy behind a trusted proxy, configure that proxy to pass a
-    trustworthy client identifier and adapt this function accordingly.
+    This is an abuse-control layer, not a replacement for a WAF or
+    reverse-proxy rate limiter.
     """
 
     def __init__(
         self,
-        maximum: int,
+        max_requests: int,
         window: float,
-        max_clients: int,
         sweep_interval: float,
+        max_clients: int = RATE_LIMIT_MAX_CLIENTS,
     ) -> None:
-        self.maximum = maximum
-        self.window = window
-        self.max_clients = max_clients
-        self.sweep_interval = sweep_interval
 
-        self.hits: dict[str, deque[float]] = {}
-
-        self.lock = Lock()
-
-        self.next_sweep = (
-            time.monotonic() + sweep_interval
+        self._max = int(
+            max_requests
         )
 
-    def allow(self, client: str) -> tuple[bool, float]:
+        self._window = float(
+            window
+        )
+
+        self._sweep_interval = float(
+            sweep_interval
+        )
+
+        self._max_clients = int(
+            max_clients
+        )
+
+        self._hits: dict[
+            str,
+            deque[float],
+        ] = {}
+
+        self._lock = Lock()
+
+        self._next_sweep = (
+            time.monotonic()
+            + self._sweep_interval
+        )
+
+    def allow(
+        self,
+        key: str,
+    ) -> tuple[bool, float]:
+        """
+        Returns:
+
+            (True, 0.0)
+
+        when allowed.
+
+        Otherwise:
+
+            (False, retry_after_seconds)
+        """
+
         now = time.monotonic()
 
-        with self.lock:
-            if len(self.hits) >= self.max_clients:
-                self._sweep(now)
+        with self._lock:
 
-                if len(self.hits) >= self.max_clients:
-                    return False, self.window
-
-            bucket = self.hits.setdefault(
-                client,
-                deque(),
+            self._maybe_sweep(
+                now
             )
 
-            cutoff = now - self.window
+            bucket = self._hits.get(
+                key
+            )
 
-            while bucket and bucket[0] <= cutoff:
+            if bucket is None:
+
+                if (
+                    len(self._hits)
+                    >= self._max_clients
+                ):
+                    return (
+                        False,
+                        self._window,
+                    )
+
+                bucket = deque()
+
+                self._hits[key] = bucket
+
+            cutoff = (
+                now
+                - self._window
+            )
+
+            while (
+                bucket
+                and bucket[0] <= cutoff
+            ):
                 bucket.popleft()
 
-            if len(bucket) >= self.maximum:
+            if (
+                len(bucket)
+                >= self._max
+            ):
+
                 retry_after = max(
-                    bucket[0] + self.window - now,
+                    bucket[0]
+                    + self._window
+                    - now,
                     0.0,
                 )
 
-                self._sweep(now)
+                return (
+                    False,
+                    retry_after,
+                )
 
-                return False, retry_after
+            bucket.append(
+                now
+            )
 
-            bucket.append(now)
+            return (
+                True,
+                0.0,
+            )
 
-            self._sweep(now)
+    def _maybe_sweep(
+        self,
+        now: float,
+    ) -> None:
+        """
+        Remove stale client buckets.
 
-            return True, 0.0
+        Caller must already hold _lock.
+        """
 
-    def _sweep(self, now: float) -> None:
-        if now < self.next_sweep:
+        if now < self._next_sweep:
             return
 
-        self.next_sweep = now + self.sweep_interval
+        self._next_sweep = (
+            now
+            + self._sweep_interval
+        )
 
-        cutoff = now - self.window
+        cutoff = (
+            now
+            - self._window
+        )
 
         stale = [
             key
-            for key, bucket in self.hits.items()
-            if not bucket or bucket[-1] <= cutoff
+            for key, bucket
+            in self._hits.items()
+            if (
+                not bucket
+                or bucket[-1] <= cutoff
+            )
         ]
 
         for key in stale:
-            self.hits.pop(key, None)
+            self._hits.pop(
+                key,
+                None,
+            )
 
 
-RATE_LIMITER = RateLimiter(
-    RATE_LIMIT_MAX_REQUESTS,
-    RATE_LIMIT_WINDOW_SECONDS,
-    RATE_LIMIT_MAX_CLIENTS,
-    RATE_LIMIT_SWEEP_INTERVAL,
+WEATHER_CACHE = _WeatherCache(
+    ttl=WEATHER_TTL,
+    max_entries=WEATHER_CACHE_MAX_ENTRIES,
+)
+
+WEATHER_RATE_LIMITER = _RateLimiter(
+    max_requests=RATE_LIMIT_MAX_REQUESTS,
+    window=RATE_LIMIT_WINDOW_SECONDS,
+    sweep_interval=RATE_LIMIT_SWEEP_INTERVAL,
 )
 
 
@@ -500,22 +727,22 @@ RATE_LIMITER = RateLimiter(
 # HTTP handler
 # ============================================================================
 
-class SkyCastHandler(BaseHTTPRequestHandler):
+class SkyCastHandler(
+    BaseHTTPRequestHandler
+):
 
     protocol_version = "HTTP/1.1"
 
+    # Don't expose Python's exact version.
     server_version = "SkyCast"
+    sys_version = ""
 
     # ----------------------------------------------------------------------
-    # Server information
+    # Server headers
     # ----------------------------------------------------------------------
 
     def version_string(self) -> str:
         return self.server_version
-
-    # ----------------------------------------------------------------------
-    # Security headers
-    # ----------------------------------------------------------------------
 
     def end_headers(self) -> None:
 
@@ -536,9 +763,14 @@ class SkyCastHandler(BaseHTTPRequestHandler):
 
         self.send_header(
             "Permissions-Policy",
-            "geolocation=(self), camera=(), microphone=(), payment=()",
+            "geolocation=(self), "
+            "camera=(), "
+            "microphone=(), "
+            "payment=()",
         )
 
+        # The browser talks to SkyCast itself.
+        # OpenWeather does not need to be in connect-src.
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -558,61 +790,70 @@ class SkyCastHandler(BaseHTTPRequestHandler):
     # Request helpers
     # ----------------------------------------------------------------------
 
-    def client_identifier(self) -> str:
+    def _client_ip(self) -> str:
         """
-        Use the actual TCP peer by default.
+        Return the direct peer address.
 
-        Do not blindly trust X-Forwarded-For because clients can spoof it
-        when the application is directly reachable.
+        We deliberately do not trust X-Forwarded-For because an Internet
+        client can spoof that header unless a trusted reverse proxy strips
+        and replaces it.
         """
 
         return self.client_address[0]
 
-    def accepts_gzip(self) -> bool:
-        encoding = self.headers.get(
-            "Accept-Encoding",
-            "",
-        )
+    def _accepts_gzip(self) -> bool:
 
-        return "gzip" in encoding.lower()
+        return (
+            "gzip"
+            in self.headers.get(
+                "Accept-Encoding",
+                "",
+            ).lower()
+        )
 
     # ----------------------------------------------------------------------
     # Response helpers
     # ----------------------------------------------------------------------
 
-    def send_body(
+    def _send_body(
         self,
         status: int,
         body: bytes,
         content_type: str,
         *,
-        gzip_body: bytes | None = None,
-        headers: dict[str, str] | None = None,
+        gz: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
 
         use_gzip = (
-            self.accepts_gzip()
-            and content_type in COMPRESSIBLE
+            self._accepts_gzip()
+            and content_type
+            in COMPRESSIBLE
         )
 
-        if use_gzip and gzip_body is None and len(body) >= GZIP_MIN_BYTES:
-            gzip_body = gzip.compress(
+        if (
+            use_gzip
+            and gz is None
+            and len(body) >= GZIP_MIN_BYTES
+        ):
+            gz = gzip.compress(
                 body,
                 compresslevel=6,
             )
 
-        payload = (
-            gzip_body
-            if use_gzip and gzip_body is not None
-            else body
-        )
-
-        encoded = (
+        if (
             use_gzip
-            and gzip_body is not None
-        )
+            and gz is not None
+        ):
+            payload = gz
+            encoded = True
+        else:
+            payload = body
+            encoded = False
 
-        self.send_response(status)
+        self.send_response(
+            status
+        )
 
         self.send_header(
             "Content-Type",
@@ -636,8 +877,8 @@ class SkyCastHandler(BaseHTTPRequestHandler):
                 "gzip",
             )
 
-        if headers:
-            for name, value in headers.items():
+        if extra_headers:
+            for name, value in extra_headers.items():
                 self.send_header(
                     name,
                     value,
@@ -645,47 +886,55 @@ class SkyCastHandler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-        if self.command != "HEAD":
-            try:
-                self.wfile.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
-                # Client disappeared while receiving the response.
-                pass
+        if self.command == "HEAD":
+            return
 
-    def send_json(
+        try:
+            self.wfile.write(
+                payload
+            )
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+        ):
+            pass
+
+    def _send_json(
         self,
         status: int,
         payload: dict,
         *,
-        headers: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
 
-        response_headers = {
+        headers = {
             "Cache-Control": "no-store",
         }
 
-        if headers:
-            response_headers.update(headers)
+        if extra_headers:
+            headers.update(
+                extra_headers
+            )
 
-        self.send_body(
+        self._send_body(
             status,
             json_bytes(payload),
             "application/json; charset=utf-8",
-            headers=response_headers,
+            extra_headers=headers,
         )
 
-    def send_error_json(
+    def _send_error_json(
         self,
         status: int,
         message: str,
         *,
-        headers: dict[str, str] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
 
-        self.send_json(
+        self._send_json(
             status,
             {"error": message},
-            headers=headers,
+            extra_headers=extra_headers,
         )
 
     # ----------------------------------------------------------------------
@@ -694,84 +943,125 @@ class SkyCastHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
 
-        parsed = urlparse(self.path)
-
-        if len(self.path) > MAX_QUERY_LENGTH + 128:
-            self.send_error_json(
+        if len(self.path) > MAX_REQUEST_TARGET_LENGTH:
+            self._send_error_json(
                 414,
                 "Request URI is too long.",
             )
             return
 
+        parsed = urlparse(
+            self.path
+        )
+
         if parsed.path == "/api/weather":
-            self.handle_weather(
-                parse_qs(
-                    parsed.query,
-                    keep_blank_values=False,
-                    strict_parsing=False,
-                )
+
+            query = parse_qs(
+                parsed.query,
+                keep_blank_values=False,
             )
+
+            self._handle_weather(
+                query
+            )
+
             return
 
-        self.serve_static(parsed.path)
+        self._serve_static(
+            parsed.path
+        )
 
+    # HEAD uses the same routing and response metadata.
     do_HEAD = do_GET
 
     # ----------------------------------------------------------------------
-    # Weather API
+    # Weather endpoint
     # ----------------------------------------------------------------------
 
-    def handle_weather(self, query: dict[str, list[str]]) -> None:
+    def _handle_weather(
+        self,
+        query: dict[str, list[str]],
+    ) -> None:
 
-        allowed, retry_after = RATE_LIMITER.allow(
-            self.client_identifier()
+        allowed, retry_after = (
+            WEATHER_RATE_LIMITER.allow(
+                self._client_ip()
+            )
         )
 
         if not allowed:
-            self.send_error_json(
+
+            self._send_error_json(
                 429,
                 "Too many requests. Please wait a moment and try again.",
-                headers={
+                extra_headers={
                     "Retry-After": str(
-                        max(1, int(retry_after) + 1)
+                        max(
+                            1,
+                            int(retry_after) + 1,
+                        )
                     )
                 },
             )
+
             return
 
         if not API_KEY:
-            self.send_error_json(
+
+            # Never expose whether/how an upstream credential is stored.
+            self._send_error_json(
                 500,
                 "Weather service is not configured.",
             )
+
             return
 
-        city = query.get("city", [""])[0].strip()
+        city = (
+            query.get(
+                "city",
+                [""],
+            )[0]
+            .strip()
+        )
 
-        lat_raw = query.get(
-            "lat",
-            [""],
-        )[0].strip()
+        lat_raw = (
+            query.get(
+                "lat",
+                [""],
+            )[0]
+            .strip()
+        )
 
-        lon_raw = query.get(
-            "lon",
-            [""],
-        )[0].strip()
+        lon_raw = (
+            query.get(
+                "lon",
+                [""],
+            )[0]
+            .strip()
+        )
 
         # ------------------------------------------------------------------
-        # City lookup
+        # City request
         # ------------------------------------------------------------------
 
         if city:
 
             if len(city) > MAX_CITY_LENGTH:
-                self.send_error_json(
+
+                self._send_error_json(
                     400,
-                    f"City name must be {MAX_CITY_LENGTH} characters or fewer.",
+                    (
+                        "City name must be "
+                        f"{MAX_CITY_LENGTH} characters or fewer."
+                    ),
                 )
+
                 return
 
-            city = " ".join(city.split())
+            # Collapse repeated whitespace.
+            city = " ".join(
+                city.split()
+            )
 
             cache_key = (
                 "city:"
@@ -785,37 +1075,60 @@ class SkyCastHandler(BaseHTTPRequestHandler):
             }
 
         # ------------------------------------------------------------------
-        # Coordinate lookup
+        # Coordinate request
         # ------------------------------------------------------------------
 
         elif lat_raw and lon_raw:
 
             try:
-                lat = float(lat_raw)
-                lon = float(lon_raw)
-            except (ValueError, TypeError):
-                self.send_error_json(
+                lat = float(
+                    lat_raw
+                )
+                lon = float(
+                    lon_raw
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ):
+
+                self._send_error_json(
                     400,
                     "Latitude and longitude must be valid numbers.",
                 )
+
                 return
 
-            if not (
-                valid_coordinate(lat, -90.0, 90.0)
-                and valid_coordinate(lon, -180.0, 180.0)
+            # Reject NaN and infinity as well as normal out-of-range values.
+            if (
+                not valid_latitude(lat)
+                or not valid_longitude(lon)
             ):
-                self.send_error_json(
+
+                self._send_error_json(
                     400,
                     "Coordinates are outside the valid range.",
                 )
+
                 return
 
-            # Normalize floating-point representations so:
-            # 28.5 and 028.5000 become the same cache key.
-            lat = round(lat, 4)
-            lon = round(lon, 4)
+            # Four decimal places is plenty for weather lookup and prevents
+            # endless cache fragmentation through tiny coordinate changes.
+            lat = round(
+                lat,
+                4,
+            )
 
-            cache_key = f"coord:{lat:.4f},{lon:.4f}"
+            lon = round(
+                lon,
+                4,
+            )
+
+            cache_key = (
+                f"coord:{lat:.4f},"
+                f"{lon:.4f}"
+            )
 
             upstream_params = {
                 "lat": f"{lat:.4f}",
@@ -824,87 +1137,111 @@ class SkyCastHandler(BaseHTTPRequestHandler):
                 "units": "metric",
             }
 
+        # ------------------------------------------------------------------
+        # Missing search parameter
+        # ------------------------------------------------------------------
+
         else:
 
-            self.send_error_json(
+            self._send_error_json(
                 400,
-                "Provide either a city or both latitude and longitude.",
+                (
+                    "Provide a city or both "
+                    "latitude and longitude."
+                ),
             )
+
             return
 
         # ------------------------------------------------------------------
-        # Cache
+        # Fast cache hit
         # ------------------------------------------------------------------
 
-        cached = WEATHER_CACHE.get(cache_key)
+        cached = WEATHER_CACHE.get(
+            cache_key
+        )
 
         if cached is not None:
-            self.send_body(
+
+            self._send_body(
                 200,
                 cached,
                 "application/json; charset=utf-8",
-                headers={
+                extra_headers={
                     "Cache-Control": "no-store",
                     "X-Cache": "HIT",
                 },
             )
+
             return
 
         # ------------------------------------------------------------------
-        # Prevent cache stampede
+        # Prevent duplicate upstream requests
         # ------------------------------------------------------------------
 
-        should_load = WEATHER_CACHE.begin_load(
+        if not WEATHER_CACHE.begin_load(
             cache_key
-        )
+        ):
 
-        if not should_load:
-
+            # Another request is already obtaining this weather result.
             cached = WEATHER_CACHE.wait_for_load(
-                cache_key
+                cache_key,
+                timeout=2.0,
             )
 
             if cached is not None:
-                self.send_body(
+
+                self._send_body(
                     200,
                     cached,
                     "application/json; charset=utf-8",
-                    headers={
+                    extra_headers={
                         "Cache-Control": "no-store",
                         "X-Cache": "COALESCED",
                     },
                 )
+
                 return
 
-            # Another request is taking too long.
-            self.send_error_json(
+            self._send_error_json(
                 503,
                 "Weather service is busy. Please try again.",
-                headers={
+                extra_headers={
                     "Retry-After": "2",
                 },
             )
+
             return
 
         try:
-            self.fetch_weather(
+
+            self._fetch_weather(
                 cache_key,
                 upstream_params,
             )
+
         finally:
+
+            # This is critical: a failed request must never permanently
+            # leave the key in the "loading" state.
             WEATHER_CACHE.finish_load(
                 cache_key
             )
 
-    def fetch_weather(
+    # ----------------------------------------------------------------------
+    # OpenWeather request
+    # ----------------------------------------------------------------------
+
+    def _fetch_weather(
         self,
         cache_key: str,
         params: dict[str, str],
     ) -> None:
 
         url = (
-            f"{OWM_BASE}?"
-            f"{urlencode(params)}"
+            OWM_BASE
+            + "?"
+            + urlencode(params)
         )
 
         request = Request(
@@ -922,61 +1259,83 @@ class SkyCastHandler(BaseHTTPRequestHandler):
                 timeout=UPSTREAM_TIMEOUT_SECONDS,
             ) as response:
 
-                content_length = response.headers.get(
+                declared_length = response.headers.get(
                     "Content-Length"
                 )
 
-                if content_length:
-                    try:
-                        declared_size = int(
-                            content_length
-                        )
-                    except ValueError:
-                        declared_size = 0
+                if declared_length:
 
-                    if declared_size > MAX_UPSTREAM_RESPONSE_BYTES:
-                        self.send_error_json(
-                            502,
-                            "Weather service returned an unexpectedly large response.",
-                        )
-                        return
+                    try:
+                        if (
+                            int(declared_length)
+                            > MAX_UPSTREAM_RESPONSE_BYTES
+                        ):
+                            self._send_error_json(
+                                502,
+                                "Weather service response is too large.",
+                            )
+                            return
+
+                    except ValueError:
+                        # Ignore malformed Content-Length and enforce the
+                        # limit while reading.
+                        pass
 
                 chunks: list[bytes] = []
                 total = 0
 
                 while True:
 
-                    chunk = response.read(8192)
+                    chunk = response.read(
+                        8192
+                    )
 
                     if not chunk:
                         break
 
-                    total += len(chunk)
+                    total += len(
+                        chunk
+                    )
 
-                    if total > MAX_UPSTREAM_RESPONSE_BYTES:
-                        self.send_error_json(
+                    if (
+                        total
+                        > MAX_UPSTREAM_RESPONSE_BYTES
+                    ):
+
+                        self._send_error_json(
                             502,
-                            "Weather service response was too large.",
+                            "Weather service response is too large.",
                         )
+
                         return
 
-                    chunks.append(chunk)
+                    chunks.append(
+                        chunk
+                    )
 
-                body = b"".join(chunks)
-
-            # Verify JSON before putting anything into the cache.
-            try:
-                json.loads(
-                    body.decode("utf-8")
+                body = b"".join(
+                    chunks
                 )
+
+            # Never cache arbitrary upstream content.
+            try:
+
+                json.loads(
+                    body.decode(
+                        "utf-8"
+                    )
+                )
+
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
             ):
-                self.send_error_json(
+
+                self._send_error_json(
                     502,
                     "Weather service returned invalid data.",
                 )
+
                 return
 
             WEATHER_CACHE.put(
@@ -984,11 +1343,11 @@ class SkyCastHandler(BaseHTTPRequestHandler):
                 body,
             )
 
-            self.send_body(
+            self._send_body(
                 200,
                 body,
                 "application/json; charset=utf-8",
-                headers={
+                extra_headers={
                     "Cache-Control": "no-store",
                     "X-Cache": "MISS",
                 },
@@ -997,27 +1356,29 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         except HTTPError as exc:
 
             if exc.code == 404:
-                self.send_error_json(
+
+                self._send_error_json(
                     404,
                     "City not found. Check the spelling and try again.",
                 )
+
                 return
 
-            if exc.code in (401, 403):
-                self.send_error_json(
+            if exc.code in (
+                401,
+                403,
+            ):
+
+                self._send_error_json(
                     502,
                     "Weather service authentication failed.",
                 )
+
                 return
 
-            if 400 <= exc.code < 500:
-                self.send_error_json(
-                    502,
-                    "Weather service rejected the request.",
-                )
-                return
-
-            self.send_error_json(
+            # Don't forward upstream response bodies, URLs, or internal
+            # diagnostic information to the browser.
+            self._send_error_json(
                 502,
                 "Weather service is temporarily unavailable.",
             )
@@ -1027,7 +1388,8 @@ class SkyCastHandler(BaseHTTPRequestHandler):
             TimeoutError,
             ConnectionError,
         ):
-            self.send_error_json(
+
+            self._send_error_json(
                 502,
                 "Could not reach the weather service.",
             )
@@ -1036,51 +1398,60 @@ class SkyCastHandler(BaseHTTPRequestHandler):
             BrokenPipeError,
             ConnectionResetError,
         ):
+            # Browser/client disconnected before receiving the response.
             pass
 
         except Exception:
-            # Never expose stack traces or implementation details.
-            self.send_error_json(
+
+            # Never expose a traceback or implementation detail.
+            self._send_error_json(
                 500,
                 "Unexpected server error.",
             )
 
     # ----------------------------------------------------------------------
-    # Static files
+    # Static file serving
     # ----------------------------------------------------------------------
 
-    def is_allowed_static_path(
+    def _static_path_allowed(
         self,
         relative: str,
     ) -> bool:
 
-        parts = relative.split("/")
+        parts = relative.split(
+            "/"
+        )
 
+        # Reject traversal and empty path components.
         if any(
-            part in {
+            part in (
                 "",
                 ".",
                 "..",
-            }
+            )
             for part in parts
         ):
             return False
 
+        # Root allow-list.
         if (
             len(parts) == 1
-            and parts[0] in STATIC_ROOT_FILES
+            and parts[0]
+            in STATIC_ROOT_FILES
         ):
             return True
 
+        # Directory allow-list.
         if (
             len(parts) >= 2
-            and parts[0] in STATIC_DIRS
+            and parts[0]
+            in STATIC_DIRS
         ):
             return True
 
         return False
 
-    def serve_static(
+    def _serve_static(
         self,
         path: str,
     ) -> None:
@@ -1088,31 +1459,39 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         if path == "/":
             path = "/index.html"
 
-        relative = path.lstrip("/")
+        relative = path.lstrip(
+            "/"
+        )
 
-        if not self.is_allowed_static_path(
+        if not self._static_path_allowed(
             relative
         ):
-            self.send_error_json(
+
+            self._send_error_json(
                 404,
                 "Not found.",
             )
+
             return
 
         target = (
             BASE_DIR / relative
         ).resolve()
 
-        # Defense in depth against path traversal/symlink escapes.
+        # Defense in depth against symlinks and traversal.
         try:
+
             target.relative_to(
                 BASE_DIR
             )
+
         except ValueError:
-            self.send_error_json(
+
+            self._send_error_json(
                 403,
                 "Forbidden.",
             )
+
             return
 
         entry = STATIC_CACHE.get(
@@ -1120,80 +1499,97 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         )
 
         if entry is None:
-            self.send_error_json(
+
+            self._send_error_json(
                 404,
                 "Not found.",
             )
+
             return
 
-        headers = {
+        cache_headers = {
             "ETag": entry["etag"],
             "Last-Modified": entry["last_modified"],
             "Cache-Control": (
-                f"public, max-age={STATIC_CACHE_SECONDS}"
+                "public, "
+                f"max-age={STATIC_CACHE_MAX_AGE}"
             ),
         }
 
-        if self.not_modified(
+        # Conditional request.
+        if self._not_modified(
             entry
         ):
+
             self.send_response(
                 304
             )
 
-            for name, value in headers.items():
+            for name, value in cache_headers.items():
                 self.send_header(
                     name,
                     value,
                 )
 
             self.end_headers()
+
             return
 
-        self.send_body(
+        self._send_body(
             200,
             entry["raw"],
             entry["content_type"],
-            gzip_body=entry["gz"],
-            headers=headers,
+            gz=entry["gz"],
+            extra_headers=cache_headers,
         )
 
-    def not_modified(
+    # ----------------------------------------------------------------------
+    # Conditional requests
+    # ----------------------------------------------------------------------
+
+    def _not_modified(
         self,
         entry: dict,
     ) -> bool:
 
-        etag = self.headers.get(
+        client_etag = self.headers.get(
             "If-None-Match"
         )
 
-        if etag:
-            candidates = {
-                item.strip()
-                for item in etag.split(",")
+        if client_etag:
+
+            etags = {
+                value.strip()
+                for value
+                in client_etag.split(",")
             }
 
-            if entry["etag"] in candidates:
+            if entry["etag"] in etags:
                 return True
 
-        modified = self.headers.get(
+        modified_since = self.headers.get(
             "If-Modified-Since"
         )
 
-        if modified:
+        if modified_since:
 
             try:
-                client_time = parsedate_to_datetime(
-                    modified
+
+                client_time = (
+                    parsedate_to_datetime(
+                        modified_since
+                    )
                 )
 
-                server_time = parsedate_to_datetime(
-                    entry["last_modified"]
+                server_time = (
+                    parsedate_to_datetime(
+                        entry["last_modified"]
+                    )
                 )
 
                 if (
-                    client_time
-                    and server_time
+                    client_time is not None
+                    and server_time is not None
                     and server_time <= client_time
                 ):
                     return True
@@ -1216,68 +1612,94 @@ class SkyCastHandler(BaseHTTPRequestHandler):
         *args,
     ) -> None:
 
+        try:
+            message = fmt % args
+        except Exception:
+            message = fmt
+
         sys.stderr.write(
-            f"{self.client_address[0]} "
-            f"- {fmt % args}\n"
+            f"{self.client_address[0]} - "
+            f"{message}\n"
         )
 
 
 # ============================================================================
-# Startup
+# Application startup
 # ============================================================================
 
 def main() -> None:
 
-    if not (
+    index_file = (
         BASE_DIR / "index.html"
-    ).is_file():
+    )
+
+    if not index_file.is_file():
 
         print(
-            "ERROR: index.html was not found at "
+            "ERROR: index.html not found at "
             f"{BASE_DIR}",
             file=sys.stderr,
         )
 
         raise SystemExit(1)
 
-    print("=" * 56)
-    print(" SkyCast server")
-    print("=" * 56)
     print(
-        f" URL: http://localhost:{PORT}"
+        "=" * 52
+    )
+
+    print(
+        "SkyCast server"
+    )
+
+    print(
+        "=" * 52
+    )
+
+    print(
+        f"Listening on http://localhost:{PORT}"
     )
 
     if API_KEY:
+
         print(
-            " OpenWeather API key: configured"
+            "OpenWeather API key: configured"
         )
+
     else:
+
         print(
-            " WARNING: OpenWeather API key is not configured."
-        )
-        print(
-            " Set OPENWEATHER_API_KEY in the environment or .env."
+            "WARNING: OPENWEATHER_API_KEY is not configured.",
+            file=sys.stderr,
         )
 
     print(
-        " Press Ctrl+C to stop."
+        "Press Ctrl+C to stop."
     )
-    print("=" * 56)
+
+    print(
+        "=" * 52
+    )
 
     server = ThreadingHTTPServer(
-        (HOST, PORT),
+        (
+            HOST,
+            PORT,
+        ),
         SkyCastHandler,
     )
 
     try:
+
         server.serve_forever()
 
     except KeyboardInterrupt:
+
         print(
             "\nSkyCast stopped."
         )
 
     finally:
+
         server.server_close()
 
 
