@@ -1,44 +1,118 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="SkyCast — real-time weather for any city in the world." />
-  <meta name="theme-color" content="#0b1e3f" />
+  <meta charset="utf-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  >
+
+  <meta
+    name="description"
+    content="SkyCast — fast, real-time weather for cities around the world."
+  >
+
+  <meta name="theme-color" content="#0b1e3f">
+
   <title>SkyCast · Weather</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛅</text></svg>" />
-  <!-- Warm up the TCP+TLS connection to the weather-icon CDN early. -->
-  <link rel="preconnect" href="https://openweathermap.org" crossorigin />
-  <link rel="stylesheet" href="css/style.css" />
+
+  <!-- Inline SVG favicon avoids an additional network request. -->
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9B%85%3C/text%3E%3C/svg%3E"
+  >
+
+  <!--
+    Keep only the preconnects actually needed by the application.
+    If weather requests go through your own backend, remove the
+    OpenWeather preconnect entirely.
+  -->
+  <link rel="preconnect" href="https://api.openweathermap.org">
+
+  <link rel="stylesheet" href="css/style.css">
+
+  <!--
+    Optional CSP starter.
+
+    IMPORTANT:
+    If your CSS/JS/CDN architecture changes, update this policy.
+    For strongest security, send CSP as an HTTP response header
+    from your server rather than using a meta tag.
+  -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="
+      default-src 'self';
+      connect-src 'self' https://api.openweathermap.org;
+      img-src 'self' data: https://openweathermap.org;
+      style-src 'self';
+      script-src 'self';
+      object-src 'none';
+      base-uri 'self';
+      form-action 'self';
+      frame-ancestors 'none';
+    "
+  >
 </head>
+
 <body>
   <div class="app" id="app">
-    <!-- ===== Header ===== -->
+
+    <!-- ==================== Header ==================== -->
     <header class="header">
       <h1 class="brand">
         <span class="brand__icon" aria-hidden="true">⛅</span>
         Sky<span class="brand__accent">Cast</span>
       </h1>
-      <p class="tagline">Real-time weather, anywhere in the world.</p>
+
+      <p class="tagline">
+        Real-time weather, anywhere in the world.
+      </p>
     </header>
 
-    <!-- ===== Search ===== -->
-    <section class="search" aria-label="Search for a city">
-      <form id="search-form" class="search__form" role="search" autocomplete="off">
+
+    <!-- ==================== Search ==================== -->
+    <section class="search" aria-label="Weather search">
+
+      <form
+        id="search-form"
+        class="search__form"
+        role="search"
+        autocomplete="off"
+        novalidate
+      >
         <div class="search__field">
           <span class="search__icon" aria-hidden="true">🔍</span>
+
+          <label class="sr-only" for="city-input">
+            City name
+          </label>
+
           <input
-            type="text"
+            type="search"
             id="city-input"
             class="search__input"
+            name="city"
             placeholder="Search for a city…"
-            aria-label="City name"
+            inputmode="search"
+            enterkeyhint="search"
             spellcheck="false"
-          />
+            autocomplete="off"
+            autocapitalize="words"
+            maxlength="100"
+            required
+          >
         </div>
-        <button type="submit" class="btn btn--primary" id="search-btn">
+
+        <button
+          type="submit"
+          class="btn btn--primary"
+          id="search-btn"
+        >
           Search
         </button>
+
         <button
           type="button"
           class="btn btn--ghost"
@@ -50,104 +124,337 @@
         </button>
       </form>
 
-      <!-- Units toggle -->
-      <div class="units" role="group" aria-label="Temperature units">
-        <button type="button" class="units__btn is-active" data-unit="metric" id="unit-c">°C</button>
-        <button type="button" class="units__btn" data-unit="imperial" id="unit-f">°F</button>
+
+      <!-- Temperature units -->
+      <div
+        class="units"
+        role="group"
+        aria-label="Temperature units"
+      >
+        <button
+          type="button"
+          class="units__btn is-active"
+          data-unit="metric"
+          id="unit-c"
+          aria-pressed="true"
+        >
+          °C
+        </button>
+
+        <button
+          type="button"
+          class="units__btn"
+          data-unit="imperial"
+          id="unit-f"
+          aria-pressed="false"
+        >
+          °F
+        </button>
       </div>
+
     </section>
 
-    <!-- ===== Status region (loading / error) ===== -->
-    <div class="status" aria-live="polite">
-      <!-- Loading spinner -->
-      <div class="loader" id="loader" hidden>
-        <div class="loader__spinner" aria-hidden="true"></div>
-        <p class="loader__text">Fetching the latest weather…</p>
-      </div>
 
-      <!-- Error message -->
-      <div class="message message--error" id="error" hidden>
-        <span class="message__icon" aria-hidden="true">⚠️</span>
-        <p class="message__text" id="error-text"></p>
-      </div>
+    <!-- ==================== Status ==================== -->
+    <div
+      class="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >
 
-      <!-- First-load hint -->
-      <div class="message message--hint" id="hint">
-        <span class="message__icon" aria-hidden="true">🌍</span>
-        <p class="message__text">
-          Search for a city or tap <strong>📍</strong> to use your location.
+      <!-- Loading -->
+      <div
+        class="loader"
+        id="loader"
+        hidden
+        role="status"
+      >
+        <div
+          class="loader__spinner"
+          aria-hidden="true"
+        ></div>
+
+        <p class="loader__text">
+          Fetching the latest weather…
         </p>
       </div>
+
+
+      <!-- Error -->
+      <div
+        class="message message--error"
+        id="error"
+        hidden
+        role="alert"
+      >
+        <span
+          class="message__icon"
+          aria-hidden="true"
+        >
+          ⚠️
+        </span>
+
+        <p
+          class="message__text"
+          id="error-text"
+        ></p>
+      </div>
+
+
+      <!-- Initial hint -->
+      <div
+        class="message message--hint"
+        id="hint"
+      >
+        <span
+          class="message__icon"
+          aria-hidden="true"
+        >
+          🌍
+        </span>
+
+        <p class="message__text">
+          Search for a city or tap
+          <strong aria-hidden="true">📍</strong>
+          <span class="sr-only">the location button</span>
+          to use your location.
+        </p>
+      </div>
+
     </div>
 
-    <!-- ===== Weather card ===== -->
+
+    <!-- ==================== Weather ==================== -->
     <main>
-      <section class="card weather" id="weather" hidden aria-live="polite">
+      <section
+        class="card weather"
+        id="weather"
+        hidden
+        aria-labelledby="w-city"
+      >
+
         <div class="weather__head">
+
           <div>
-            <h2 class="weather__city" id="w-city">—</h2>
-            <p class="weather__desc" id="w-desc">—</p>
-            <p class="weather__time" id="w-time">—</p>
+            <h2
+              class="weather__city"
+              id="w-city"
+            >
+              —
+            </h2>
+
+            <p
+              class="weather__desc"
+              id="w-desc"
+            >
+              —
+            </p>
+
+            <p
+              class="weather__time"
+              id="w-time"
+            >
+              —
+            </p>
           </div>
-          <img class="weather__icon" id="w-icon" alt="" width="120" height="120" />
+
+          <img
+            class="weather__icon"
+            id="w-icon"
+            src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
+            alt=""
+            width="120"
+            height="120"
+            decoding="async"
+          >
+
         </div>
 
-        <div class="weather__temp">
-          <span id="w-temp">—</span><span class="weather__unit" id="w-temp-unit">°C</span>
+
+        <div
+          class="weather__temp"
+          aria-label="Current temperature"
+        >
+          <span id="w-temp">—</span>
+          <span
+            class="weather__unit"
+            id="w-temp-unit"
+          >
+            °C
+          </span>
         </div>
+
+
         <p class="weather__feels">
-          Feels like <span id="w-feels">—</span>
+          Feels like
+          <span id="w-feels">—</span>
         </p>
 
-        <!-- Detail tiles -->
+
+        <!-- ==================== Details ==================== -->
         <ul class="stats">
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">💧</span>
-            <span class="stat__label">Humidity</span>
-            <span class="stat__value" id="w-humidity">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              💧
+            </span>
+
+            <span class="stat__label">
+              Humidity
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-humidity"
+            >
+              —
+            </span>
           </li>
+
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">💨</span>
-            <span class="stat__label">Wind</span>
-            <span class="stat__value" id="w-wind">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              💨
+            </span>
+
+            <span class="stat__label">
+              Wind
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-wind"
+            >
+              —
+            </span>
           </li>
+
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">🌡️</span>
-            <span class="stat__label">Pressure</span>
-            <span class="stat__value" id="w-pressure">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              🌡️
+            </span>
+
+            <span class="stat__label">
+              Pressure
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-pressure"
+            >
+              —
+            </span>
           </li>
+
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">👁️</span>
-            <span class="stat__label">Visibility</span>
-            <span class="stat__value" id="w-visibility">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              👁️
+            </span>
+
+            <span class="stat__label">
+              Visibility
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-visibility"
+            >
+              —
+            </span>
           </li>
+
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">🌅</span>
-            <span class="stat__label">Sunrise</span>
-            <span class="stat__value" id="w-sunrise">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              🌅
+            </span>
+
+            <span class="stat__label">
+              Sunrise
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-sunrise"
+            >
+              —
+            </span>
           </li>
+
+
           <li class="stat">
-            <span class="stat__icon" aria-hidden="true">🌇</span>
-            <span class="stat__label">Sunset</span>
-            <span class="stat__value" id="w-sunset">—</span>
+            <span
+              class="stat__icon"
+              aria-hidden="true"
+            >
+              🌇
+            </span>
+
+            <span class="stat__label">
+              Sunset
+            </span>
+
+            <span
+              class="stat__value"
+              id="w-sunset"
+            >
+              —
+            </span>
           </li>
+
         </ul>
+
       </section>
     </main>
 
-    <!-- ===== Footer ===== -->
+
+    <!-- ==================== Footer ==================== -->
     <footer class="footer">
       <p>
-        Built with the OpenWeather API ·
-        <span id="last-updated">SkyCast</span>
+        Weather data provided by OpenWeather ·
+        <span id="last-updated">
+          SkyCast
+        </span>
       </p>
     </footer>
+
   </div>
 
-  <!-- JS modules: order matters (helpers before app). `defer` lets them
-       download in parallel with parsing and run in order after the DOM. -->
-  <script src="js/api.js" defer></script>
-  <script src="js/ui.js" defer></script>
-  <script src="js/app.js" defer></script>
+
+  <!--
+    Single entry point.
+
+    A module is deferred automatically, so there is no need to
+    add both "type=module" and "defer".
+    
+    The application should import its own dependencies:
+
+      import { ... } from "./api.js";
+      import { ... } from "./ui.js";
+
+    This eliminates script-order dependencies in HTML.
+  -->
+  <script
+    type="module"
+    src="js/app.js"
+  ></script>
+
 </body>
 </html>
